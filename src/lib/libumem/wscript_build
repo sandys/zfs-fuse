@@ -11,7 +11,7 @@ include_dirs = """
 obj = bld.new_task_gen(
         features = 'cc cstaticlib',
         includes = include_dirs,
-        defines = [ 'std=gnu99'],
+        defines = [ 'std=gnu99','HAVE_CONFIG_H'],
         install_path = None, #prevents installation of this file
         name = 'umem',
         target = 'umem'
