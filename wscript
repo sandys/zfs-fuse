@@ -79,7 +79,7 @@ def configure(conf):
 
 
 #    conf.env.CCFLAGS = ['-Wall']
-    conf.env.CCFLAGS = ['-pipe', '-Wall', '-std=c99', '-Wno-switch', '-Wno-unused', '-Wno-missing-braces', '-Wno-parentheses', '-Wno-uninitialized', '-fno-strict-aliasing', '-D_GNU_SOURCE', '-DLINUX_AIO']
+    conf.env.CCFLAGS = ['-pipe', '-Wall', '-std=gnu99', '-Wno-switch', '-Wno-unused', '-Wno-missing-braces', '-Wno-parentheses', '-Wno-uninitialized', '-fno-strict-aliasing', '-D_GNU_SOURCE', '-DLINUX_AIO']
     conf.env.INCLUDEDIR = ['/usr/include/']
 #    conf.env['INCLUDEDIR'] = '/usr/include'
 #    conf.define('_FILE_OFFSET_BITS', 64) 
@@ -96,11 +96,19 @@ def configure(conf):
     conf.check_cc(lib='m',  uselib_store='m_lib',  mandatory=True)
     conf.check_cc(header_name='fuse/fuse_lowlevel.h', includes=['/usr/include/'], 
             ccflags='-D_FILE_OFFSET_BITS=64', uselib_store='fuse_defines', mandatory=True)
-#    conf.check_cc(header_name='attr/xattr.h', includes=['/usr/include/'], mandatory=True) # FIXME not working properly
+#    conf.check(header_name='attr/xattr.h', includes=['/usr/include/'], mandatory=True) # FIXME not working properly
+    conf.check(
+        		fragment='#include <sys/types.h>\n #include <attr/xattr.h>\nint main() { return 0; }\n',
+        		define_name='xattr_defines',
+        		execute=1,
+        		define_ret=1,
+            mandatory=True,
+        		msg='Checking for <attr/xattr.h>')
     conf.check_cc(lib='rt', uselib_store='rt_lib', mandatory=True)
     conf.check_tool('gas')
     #if not conf.env.AS: conf.env.AS = conf.env.CC
     conf.env.AS = conf.env.CC
+    conf.sub_config("src/lib/libumem")
 
 #    try:
 #		conf.check_cc(compile_filename='test.s', fragment='''
