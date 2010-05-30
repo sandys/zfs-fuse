@@ -19,7 +19,9 @@ ctx.define('PACKAGE_NAME', "umem")
 ctx.define('PACKAGE_STRING', "umem 1.0.1")
 ctx.define('PACKAGE_TARNAME', "umem")
 ctx.define('PACKAGE_VERSION', "1.0.1")
-ctx.write_config_header('config.h', env=conf.all_envs['default'])
+
+for env_name in conf.all_envs:
+  ctx.write_config_header('config.h', env=conf.all_envs[env_name])
 
 
 
