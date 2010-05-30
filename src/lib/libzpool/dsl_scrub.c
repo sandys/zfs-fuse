@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -50,9 +50,11 @@ static dsl_syncfunc_t dsl_pool_scrub_cancel_sync;
 static void scrub_visitdnode(dsl_pool_t *dp, dnode_phys_t *dnp, arc_buf_t *buf,
     uint64_t objset, uint64_t object);
 
-int zfs_scrub_min_time = 1; /* scrub for at least 1 sec each txg */
-int zfs_resilver_min_time = 3; /* resilver for at least 3 sec each txg */
+int zfs_scrub_min_time_ms = 1000; /* min millisecs to scrub per txg */
+int zfs_resilver_min_time_ms = 3000; /* min millisecs to resilver per txg */
 boolean_t zfs_no_scrub_io = B_FALSE; /* set to disable scrub i/o */
+boolean_t zfs_no_scrub_prefetch = B_FALSE; /* set to disable srub prefetching */
+enum ddt_class zfs_scrub_ddt_class_max = DDT_CLASS_DUPLICATE;
 
 extern int zfs_txg_timeout;
 
@@ -78,6 +80,7 @@ dsl_pool_scrub_setup_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 
 	dp->dp_scrub_min_txg = 0;
 	dp->dp_scrub_max_txg = tx->tx_txg;
+	dp->dp_scrub_ddt_class_max = zfs_scrub_ddt_class_max;
 
 	if (*funcp == SCRUB_FUNC_CLEAN) {
 		vdev_t *rvd = dp->dp_spa->spa_root_vdev;
@@ -101,6 +104,14 @@ dsl_pool_scrub_setup_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 		    dp->dp_scrub_min_txg ? POOL_SCRUB_RESILVER :
 		    POOL_SCRUB_EVERYTHING, B_FALSE);
 
+		/*
+		 * If this is an incremental scrub, limit the DDT scrub phase
+		 * to just the auto-ditto class (for correctness); the rest
+		 * of the scrub should go faster using top-down pruning.
+		 */
+		if (dp->dp_scrub_min_txg > TXG_INITIAL)
+			dp->dp_scrub_ddt_class_max = DDT_CLASS_DITTO;
+
 		dp->dp_spa->spa_scrub_started = B_TRUE;
 	}
 
@@ -119,8 +130,8 @@ dsl_pool_scrub_setup_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 	dp->dp_scrub_queue_obj = zap_create(dp->dp_meta_objset,
 	    ot ? ot : DMU_OT_SCRUB_QUEUE, DMU_OT_NONE, 0, tx);
 	bzero(&dp->dp_scrub_bookmark, sizeof (zbookmark_t));
+	bzero(&dp->dp_scrub_ddt_bookmark, sizeof (ddt_bookmark_t));
 	dp->dp_scrub_restart = B_FALSE;
-	dp->dp_scrub_ditto = B_FALSE;
 	dp->dp_spa->spa_scrub_errors = 0;
 
 	VERIFY(0 == zap_add(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
@@ -136,8 +147,16 @@ dsl_pool_scrub_setup_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 	    DMU_POOL_SCRUB_MAX_TXG, sizeof (uint64_t), 1,
 	    &dp->dp_scrub_max_txg, tx));
 	VERIFY(0 == zap_add(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
-	    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t), 4,
+	    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t),
+	    sizeof (dp->dp_scrub_bookmark) / sizeof (uint64_t),
 	    &dp->dp_scrub_bookmark, tx));
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_BOOKMARK, sizeof (uint64_t),
+	    sizeof (dp->dp_scrub_ddt_bookmark) / sizeof (uint64_t),
+	    &dp->dp_scrub_ddt_bookmark, tx));
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_CLASS_MAX, sizeof (uint64_t), 1,
+	    &dp->dp_scrub_ddt_class_max, tx));
 	VERIFY(0 == zap_add(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
 	    DMU_POOL_SCRUB_ERRORS, sizeof (uint64_t), 1,
 	    &dp->dp_spa->spa_scrub_errors, tx));
@@ -178,7 +197,6 @@ dsl_pool_scrub_cancel_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 		    &dp->dp_spa->spa_scrub_lock);
 	}
 	mutex_exit(&dp->dp_spa->spa_scrub_lock);
-	dp->dp_spa->spa_scrub_started = B_FALSE;
 	dp->dp_spa->spa_scrub_active = B_FALSE;
 
 	dp->dp_scrub_func = SCRUB_FUNC_NONE;
@@ -186,6 +204,7 @@ dsl_pool_scrub_cancel_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 	    dp->dp_scrub_queue_obj, tx));
 	dp->dp_scrub_queue_obj = 0;
 	bzero(&dp->dp_scrub_bookmark, sizeof (zbookmark_t));
+	bzero(&dp->dp_scrub_ddt_bookmark, sizeof (ddt_bookmark_t));
 
 	VERIFY(0 == zap_remove(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
 	    DMU_POOL_SCRUB_QUEUE, tx));
@@ -200,6 +219,11 @@ dsl_pool_scrub_cancel_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 	VERIFY(0 == zap_remove(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
 	    DMU_POOL_SCRUB_ERRORS, tx));
 
+	(void) zap_remove(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_BOOKMARK, tx);
+	(void) zap_remove(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_CLASS_MAX, tx);
+
 	spa_history_internal_log(LOG_POOL_SCRUB_DONE, dp->dp_spa, tx, cr,
 	    "complete=%u", *completep);
 
@@ -212,6 +236,7 @@ dsl_pool_scrub_cancel_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 	 */
 	vdev_dtl_reassess(dp->dp_spa->spa_root_vdev, tx->tx_txg,
 	    *completep ? dp->dp_scrub_max_txg : 0, B_TRUE);
+	dp->dp_spa->spa_scrub_started = B_FALSE;
 	if (*completep)
 		spa_event_notify(dp->dp_spa, NULL, dp->dp_scrub_min_txg ?
 		    ESC_ZFS_RESILVER_FINISH : ESC_ZFS_SCRUB_FINISH);
@@ -296,9 +321,9 @@ bookmark_is_before(dnode_phys_t *dnp, const zbookmark_t *zb1,
 }
 
 static boolean_t
-scrub_pause(dsl_pool_t *dp, const zbookmark_t *zb)
+scrub_pause(dsl_pool_t *dp, const zbookmark_t *zb, const ddt_bookmark_t *ddb)
 {
-	int elapsed_ticks;
+	uint64_t elapsed_nanosecs;
 	int mintime;
 
 	if (dp->dp_scrub_pausing)
@@ -308,19 +333,31 @@ scrub_pause(dsl_pool_t *dp, const zbookmark_t *zb)
 		return (B_FALSE); /* we're resuming */
 
 	/* We only know how to resume from level-0 blocks. */
-	if (zb->zb_level != 0)
+	if (zb != NULL && zb->zb_level != 0)
 		return (B_FALSE);
 
-	mintime = dp->dp_scrub_isresilver ? zfs_resilver_min_time :
-	    zfs_scrub_min_time;
-	elapsed_ticks = lbolt64 - dp->dp_scrub_start_time;
-	if (elapsed_ticks > hz * zfs_txg_timeout ||
-	    (elapsed_ticks > hz * mintime && txg_sync_waiting(dp))) {
-		dprintf("pausing at %llx/%llx/%llx/%llx\n",
-		    (longlong_t)zb->zb_objset, (longlong_t)zb->zb_object,
-		    (longlong_t)zb->zb_level, (longlong_t)zb->zb_blkid);
+	mintime = dp->dp_scrub_isresilver ? zfs_resilver_min_time_ms :
+	    zfs_scrub_min_time_ms;
+	elapsed_nanosecs = gethrtime() - dp->dp_scrub_start_time;
+	if (elapsed_nanosecs / NANOSEC > zfs_txg_timeout ||
+	    (elapsed_nanosecs / MICROSEC > mintime && txg_sync_waiting(dp))) {
+		if (zb) {
+			dprintf("pausing at bookmark %llx/%llx/%llx/%llx\n",
+			    (longlong_t)zb->zb_objset,
+			    (longlong_t)zb->zb_object,
+			    (longlong_t)zb->zb_level,
+			    (longlong_t)zb->zb_blkid);
+			dp->dp_scrub_bookmark = *zb;
+		}
+		if (ddb) {
+			dprintf("pausing at DDT bookmark %llx/%llx/%llx/%llx\n",
+			    (longlong_t)ddb->ddb_class,
+			    (longlong_t)ddb->ddb_type,
+			    (longlong_t)ddb->ddb_checksum,
+			    (longlong_t)ddb->ddb_cursor);
+			ASSERT(&dp->dp_scrub_ddt_bookmark == ddb);
+		}
 		dp->dp_scrub_pausing = B_TRUE;
-		dp->dp_scrub_bookmark = *zb;
 		return (B_TRUE);
 	}
 	return (B_FALSE);
@@ -414,6 +451,27 @@ traverse_zil(dsl_pool_t *dp, zil_header_t *zh)
 }
 
 static void
+scrub_prefetch(dsl_pool_t *dp, arc_buf_t *buf, blkptr_t *bp, uint64_t objset,
+    uint64_t object, uint64_t blkid)
+{
+	zbookmark_t czb;
+	uint32_t flags = ARC_NOWAIT | ARC_PREFETCH;
+
+	if (zfs_no_scrub_prefetch)
+		return;
+
+	if (BP_IS_HOLE(bp) || bp->blk_birth <= dp->dp_scrub_min_txg ||
+	    (BP_GET_LEVEL(bp) == 0 && BP_GET_TYPE(bp) != DMU_OT_DNODE))
+		return;
+
+	SET_BOOKMARK(&czb, objset, object, BP_GET_LEVEL(bp), blkid);
+
+	(void) arc_read(dp->dp_scrub_prefetch_zio_root, dp->dp_spa, bp,
+	    buf, NULL, NULL, ZIO_PRIORITY_ASYNC_READ, ZIO_FLAG_CANFAIL,
+	    &flags, &czb);
+}
+
+static void
 scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
     arc_buf_t *pbuf, blkptr_t *bp, const zbookmark_t *zb)
 {
@@ -423,7 +481,7 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 	if (bp->blk_birth <= dp->dp_scrub_min_txg)
 		return;
 
-	if (scrub_pause(dp, zb))
+	if (scrub_pause(dp, zb, NULL))
 		return;
 
 	if (!bookmark_is_zero(&dp->dp_scrub_bookmark)) {
@@ -451,6 +509,13 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 		}
 	}
 
+	/*
+	 * If dsl_pool_scrub_ddt() has aready scrubbed this block,
+	 * don't scrub it again.
+	 */
+	if (!ddt_class_contains(dp->dp_spa, dp->dp_scrub_ddt_class_max, bp))
+		(void) scrub_funcs[dp->dp_scrub_func](dp, bp, zb);
+
 	if (BP_GET_LEVEL(bp) > 0) {
 		uint32_t flags = ARC_WAIT;
 		int i;
@@ -466,9 +531,11 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 			mutex_exit(&dp->dp_spa->spa_scrub_lock);
 			return;
 		}
-		cbp = buf->b_data;
-
-		for (i = 0; i < epb; i++, cbp++) {
+		for (i = 0, cbp = buf->b_data; i < epb; i++, cbp++) {
+			scrub_prefetch(dp, buf, cbp, zb->zb_objset,
+			    zb->zb_object, zb->zb_blkid * epb + i);
+		}
+		for (i = 0, cbp = buf->b_data; i < epb; i++, cbp++) {
 			zbookmark_t czb;
 
 			SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
@@ -478,8 +545,8 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 		}
 	} else if (BP_GET_TYPE(bp) == DMU_OT_DNODE) {
 		uint32_t flags = ARC_WAIT;
-		dnode_phys_t *child_dnp;
-		int i;
+		dnode_phys_t *cdnp;
+		int i, j;
 		int epb = BP_GET_LSIZE(bp) >> DNODE_SHIFT;
 
 		err = arc_read(NULL, dp->dp_spa, bp, pbuf,
@@ -491,10 +558,15 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 			mutex_exit(&dp->dp_spa->spa_scrub_lock);
 			return;
 		}
-		child_dnp = buf->b_data;
-
-		for (i = 0; i < epb; i++, child_dnp++) {
-			scrub_visitdnode(dp, child_dnp, buf, zb->zb_objset,
+		for (i = 0, cdnp = buf->b_data; i < epb; i++, cdnp++) {
+			for (j = 0; j < cdnp->dn_nblkptr; j++) {
+				blkptr_t *cbp = &cdnp->dn_blkptr[j];
+				scrub_prefetch(dp, buf, cbp, zb->zb_objset,
+				    zb->zb_blkid * epb + i, j);
+			}
+		}
+		for (i = 0, cdnp = buf->b_data; i < epb; i++, cdnp++) {
+			scrub_visitdnode(dp, cdnp, buf, zb->zb_objset,
 			    zb->zb_blkid * epb + i);
 		}
 	} else if (BP_GET_TYPE(bp) == DMU_OT_OBJSET) {
@@ -525,7 +597,6 @@ scrub_visitbp(dsl_pool_t *dp, dnode_phys_t *dnp,
 		}
 	}
 
-	(void) scrub_funcs[dp->dp_scrub_func](dp, bp, zb);
 	if (buf)
 		(void) arc_buf_remove_ref(buf, &buf);
 }
@@ -542,7 +613,6 @@ scrub_visitdnode(dsl_pool_t *dp, dnode_phys_t *dnp, arc_buf_t *buf,
 		SET_BOOKMARK(&czb, objset, object, dnp->dn_nlevels - 1, j);
 		scrub_visitbp(dp, dnp, buf, &dnp->dn_blkptr[j], &czb);
 	}
-
 }
 
 static void
@@ -564,8 +634,8 @@ dsl_pool_ds_destroyed(dsl_dataset_t *ds, dmu_tx_t *tx)
 		return;
 
 	if (dp->dp_scrub_bookmark.zb_objset == ds->ds_object) {
-		SET_BOOKMARK(&dp->dp_scrub_bookmark, ZB_DESTROYED_OBJSET,
-		    0, 0, 0);
+		SET_BOOKMARK(&dp->dp_scrub_bookmark,
+		    ZB_DESTROYED_OBJSET, 0, 0, 0);
 	} else if (zap_remove_int(dp->dp_meta_objset, dp->dp_scrub_queue_obj,
 	    ds->ds_object, tx) != 0) {
 		return;
@@ -771,34 +841,72 @@ enqueue_cb(spa_t *spa, uint64_t dsobj, const char *dsname, void *arg)
 	return (0);
 }
 
+/*
+ * Scrub/dedup interaction.
+ *
+ * If there are N references to a deduped block, we don't want to scrub it
+ * N times -- ideally, we should scrub it exactly once.
+ *
+ * We leverage the fact that the dde's replication class (enum ddt_class)
+ * is ordered from highest replication class (DDT_CLASS_DITTO) to lowest
+ * (DDT_CLASS_UNIQUE) so that we may walk the DDT in that order.
+ *
+ * To prevent excess scrubbing, the scrub begins by walking the DDT
+ * to find all blocks with refcnt > 1, and scrubs each of these once.
+ * Since there are two replication classes which contain blocks with
+ * refcnt > 1, we scrub the highest replication class (DDT_CLASS_DITTO) first.
+ * Finally the top-down scrub begins, only visiting blocks with refcnt == 1.
+ *
+ * There would be nothing more to say if a block's refcnt couldn't change
+ * during a scrub, but of course it can so we must account for changes
+ * in a block's replication class.
+ *
+ * Here's an example of what can occur:
+ *
+ * If a block has refcnt > 1 during the DDT scrub phase, but has refcnt == 1
+ * when visited during the top-down scrub phase, it will be scrubbed twice.
+ * This negates our scrub optimization, but is otherwise harmless.
+ *
+ * If a block has refcnt == 1 during the DDT scrub phase, but has refcnt > 1
+ * on each visit during the top-down scrub phase, it will never be scrubbed.
+ * To catch this, ddt_sync_entry() notifies the scrub code whenever a block's
+ * reference class transitions to a higher level (i.e DDT_CLASS_UNIQUE to
+ * DDT_CLASS_DUPLICATE); if it transitions from refcnt == 1 to refcnt > 1
+ * while a scrub is in progress, it scrubs the block right then.
+ */
 static void
-dsl_pool_scrub_ddt(dsl_pool_t *dp, enum zio_checksum c, enum ddt_type type,
-    enum ddt_class class)
+dsl_pool_scrub_ddt(dsl_pool_t *dp)
 {
-	ddt_t *ddt = ddt_select_by_checksum(dp->dp_spa, c);
+	ddt_bookmark_t *ddb = &dp->dp_scrub_ddt_bookmark;
 	ddt_entry_t dde;
-	blkptr_t blk;
-	zbookmark_t zb = { 0 };
-	uint64_t walk = 0;
 	int error;
 
-	if (!ddt_object_exists(ddt, type, class))
-		return;
-
-	while ((error = ddt_object_walk(ddt, type, class, &dde, &walk)) == 0) {
-		int p = DDT_PHYS_DITTO;
-		ddt_bp_create(ddt, &dde.dde_key, &dde.dde_phys[p], &blk);
-		scrub_funcs[dp->dp_scrub_func](dp, &blk, &zb);
+	while ((error = ddt_walk(dp->dp_spa, ddb, &dde)) == 0) {
+		if (ddb->ddb_class > dp->dp_scrub_ddt_class_max)
+			return;
+		dsl_pool_scrub_ddt_entry(dp, ddb->ddb_checksum, &dde);
+		if (scrub_pause(dp, NULL, ddb))
+			return;
 	}
 	ASSERT(error == ENOENT);
+	ASSERT(ddb->ddb_class > dp->dp_scrub_ddt_class_max);
 }
 
-static void
-dsl_pool_scrub_ditto(dsl_pool_t *dp)
+void
+dsl_pool_scrub_ddt_entry(dsl_pool_t *dp, enum zio_checksum checksum,
+    const ddt_entry_t *dde)
 {
-	for (enum zio_checksum c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++)
-		for (enum ddt_type type = 0; type < DDT_TYPES; type++)
-			dsl_pool_scrub_ddt(dp, c, type, DDT_CLASS_DITTO);
+	const ddt_key_t *ddk = &dde->dde_key;
+	const ddt_phys_t *ddp = dde->dde_phys;
+	blkptr_t blk;
+	zbookmark_t zb = { 0 };
+
+	for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
+		if (ddp->ddp_phys_birth == 0)
+			continue;
+		ddt_bp_create(checksum, ddk, ddp, &blk);
+		scrub_funcs[dp->dp_scrub_func](dp, &blk, &zb);
+	}
 }
 
 void
@@ -815,7 +923,7 @@ dsl_pool_scrub_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 	/*
 	 * If the pool is not loaded, or is trying to unload, leave it alone.
 	 */
-	if (spa->spa_load_state != SPA_LOAD_NONE || spa_shutting_down(spa))
+	if (spa_load_state(spa) != SPA_LOAD_NONE || spa_shutting_down(spa))
 		return;
 
 	if (dp->dp_scrub_restart) {
@@ -836,13 +944,14 @@ dsl_pool_scrub_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 	}
 
 	dp->dp_scrub_pausing = B_FALSE;
-	dp->dp_scrub_start_time = lbolt64;
+	dp->dp_scrub_start_time = gethrtime();
 	dp->dp_scrub_isresilver = (dp->dp_scrub_min_txg != 0);
 	spa->spa_scrub_active = B_TRUE;
 
-	if (!dp->dp_scrub_ditto) {
-		dsl_pool_scrub_ditto(dp);
-		dp->dp_scrub_ditto = B_TRUE;
+	if (dp->dp_scrub_ddt_bookmark.ddb_class <= dp->dp_scrub_ddt_class_max) {
+		dsl_pool_scrub_ddt(dp);
+		if (dp->dp_scrub_pausing)
+			goto out;
 	}
 
 	if (dp->dp_scrub_bookmark.zb_objset == DMU_META_OBJSET) {
@@ -895,20 +1004,20 @@ dsl_pool_scrub_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 	dsl_pool_scrub_cancel_sync(dp, &complete, kcred, tx);
 	return;
 out:
-	VERIFY(0 == zap_update(dp->dp_meta_objset,
-	    DMU_POOL_DIRECTORY_OBJECT,
-	    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t), 4,
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t),
+	    sizeof (dp->dp_scrub_bookmark) / sizeof (uint64_t),
 	    &dp->dp_scrub_bookmark, tx));
-	VERIFY(0 == zap_update(dp->dp_meta_objset,
-	    DMU_POOL_DIRECTORY_OBJECT,
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_BOOKMARK, sizeof (uint64_t),
+	    sizeof (dp->dp_scrub_ddt_bookmark) / sizeof (uint64_t),
+	    &dp->dp_scrub_ddt_bookmark, tx));
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_SCRUB_DDT_CLASS_MAX, sizeof (uint64_t), 1,
+	    &dp->dp_scrub_ddt_class_max, tx));
+	VERIFY(0 == zap_update(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
 	    DMU_POOL_SCRUB_ERRORS, sizeof (uint64_t), 1,
 	    &spa->spa_scrub_errors, tx));
-
-	/* XXX this is scrub-clean specific */
-	mutex_enter(&spa->spa_scrub_lock);
-	while (spa->spa_scrub_inflight > 0)
-		cv_wait(&spa->spa_scrub_io_cv, &spa->spa_scrub_lock);
-	mutex_exit(&spa->spa_scrub_lock);
 }
 
 void

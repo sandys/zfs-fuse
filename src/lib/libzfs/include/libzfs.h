@@ -20,7 +20,7 @@
  */
 
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -86,14 +86,13 @@ enum {
 	EZFS_SHARENFSFAILED,	/* share(1M) failed */
 	EZFS_PERM,		/* permission denied */
 	EZFS_NOSPC,		/* out of space */
+	EZFS_FAULT,		/* bad address */
 	EZFS_IO,		/* I/O error */
 	EZFS_INTR,		/* signal received */
 	EZFS_ISSPARE,		/* device is a hot spare */
 	EZFS_INVALCONFIG,	/* invalid vdev configuration */
 	EZFS_RECURSIVE,		/* recursive dependency */
 	EZFS_NOHISTORY,		/* no history object */
-	EZFS_UNSHAREISCSIFAILED, /* iscsitgtd failed request to unshare */
-	EZFS_SHAREISCSIFAILED,	/* iscsitgtd failed request to share */
 	EZFS_POOLPROPS,		/* couldn't retrieve pool props */
 	EZFS_POOL_NOTSUP,	/* ops not supported for this type of pool */
 	EZFS_POOL_INVALARG,	/* invalid argument for this pool operation */
@@ -101,7 +100,6 @@ enum {
 	EZFS_OPENFAILED,	/* open of device failed */
 	EZFS_NOCAP,		/* couldn't get capacity */
 	EZFS_LABELFAILED,	/* write of label failed */
-	EZFS_ISCSISVCUNAVAIL,	/* iscsi service unavailable */
 	EZFS_BADWHO,		/* invalid permission who */
 	EZFS_BADPERM,		/* invalid permission */
 	EZFS_BADPERMSET,	/* invalid permission set name */
@@ -118,6 +116,9 @@ enum {
 	EZFS_REFTAG_RELE,	/* snapshot release: tag not found */
 	EZFS_REFTAG_HOLD,	/* snapshot hold: tag already exists */
 	EZFS_TAGTOOLONG,	/* snapshot hold/rele: tag too long */
+	EZFS_PIPEFAILED,	/* pipe create failed */
+	EZFS_THREADCREATEFAILED, /* thread create failed */
+	EZFS_POSTSPLIT_ONLINE,	/* onlining a disk after splitting it */
 	EZFS_UNKNOWN
 };
 
@@ -212,6 +213,14 @@ extern int zpool_create(libzfs_handle_t *, const char *, nvlist_t *,
 extern int zpool_destroy(zpool_handle_t *);
 extern int zpool_add(zpool_handle_t *, nvlist_t *);
 
+typedef struct splitflags {
+	/* do not split, but return the config that would be split off */
+	int dryrun : 1;
+
+	/* after splitting, import the pool */
+	int import : 1;
+} splitflags_t;
+
 /*
  * Functions to manipulate pool and vdev state
  */
@@ -225,6 +234,8 @@ extern int zpool_vdev_attach(zpool_handle_t *, const char *,
     const char *, nvlist_t *, int);
 extern int zpool_vdev_detach(zpool_handle_t *, const char *);
 extern int zpool_vdev_remove(zpool_handle_t *, const char *);
+extern int zpool_vdev_split(zpool_handle_t *, char *, nvlist_t **, nvlist_t *,
+    splitflags_t);
 
 extern int zpool_vdev_fault(zpool_handle_t *, uint64_t, vdev_aux_t);
 extern int zpool_vdev_degrade(zpool_handle_t *, uint64_t, vdev_aux_t);
@@ -297,6 +308,7 @@ typedef enum {
 
 extern zpool_status_t zpool_get_status(zpool_handle_t *, char **);
 extern zpool_status_t zpool_import_status(nvlist_t *, char **);
+extern void zpool_dump_ddt(const ddt_stat_t *dds, const ddt_histogram_t *ddh);
 
 /*
  * Statistics and configuration functions.
@@ -318,14 +330,24 @@ extern int zpool_import_props(libzfs_handle_t *, nvlist_t *, const char *,
 /*
  * Search for pools to import
  */
+
+typedef struct importargs {
+	char **path;		/* a list of paths to search		*/
+	int paths;		/* number of paths to search		*/
+	char *poolname;		/* name of a pool to find		*/
+	uint64_t guid;		/* guid of a pool to find		*/
+	char *cachefile;	/* cachefile to use for import		*/
+	int can_be_active : 1;	/* can the pool be active?		*/
+	int unique : 1;		/* does 'poolname' already exist?	*/
+	int exists : 1;		/* set on return if pool already exists	*/
+} importargs_t;
+
+extern nvlist_t *zpool_search_import(libzfs_handle_t *, importargs_t *);
+
+/* legacy pool search routines */
 extern nvlist_t *zpool_find_import(libzfs_handle_t *, int, char **);
 extern nvlist_t *zpool_find_import_cached(libzfs_handle_t *, const char *,
     char *, uint64_t);
-extern nvlist_t *zpool_find_import_byname(libzfs_handle_t *, int, char **,
-    char *);
-extern nvlist_t *zpool_find_import_byguid(libzfs_handle_t *, int, char **,
-    uint64_t, boolean_t);
-extern nvlist_t *zpool_find_import_activeok(libzfs_handle_t *, int, char **);
 
 /*
  * Miscellaneous pool functions
@@ -380,6 +402,8 @@ extern const char *zfs_prop_to_name(zfs_prop_t);
 extern int zfs_prop_set(zfs_handle_t *, const char *, const char *);
 extern int zfs_prop_get(zfs_handle_t *, zfs_prop_t, char *, size_t,
     zprop_source_t *, char *, size_t, boolean_t);
+extern int zfs_prop_get_recvd(zfs_handle_t *, const char *, char *, size_t,
+    boolean_t);
 extern int zfs_prop_get_numeric(zfs_handle_t *, zfs_prop_t, uint64_t *,
     zprop_source_t *, char *, size_t);
 extern int zfs_prop_get_userquota_int(zfs_handle_t *zhp, const char *propname,
@@ -387,10 +411,11 @@ extern int zfs_prop_get_userquota_int(zfs_handle_t *zhp, const char *propname,
 extern int zfs_prop_get_userquota(zfs_handle_t *zhp, const char *propname,
     char *propbuf, int proplen, boolean_t literal);
 extern uint64_t zfs_prop_get_int(zfs_handle_t *, zfs_prop_t);
-extern int zfs_prop_inherit(zfs_handle_t *, const char *);
+extern int zfs_prop_inherit(zfs_handle_t *, const char *, boolean_t);
 extern const char *zfs_prop_values(zfs_prop_t);
 extern int zfs_prop_is_string(zfs_prop_t prop);
 extern nvlist_t *zfs_get_user_props(zfs_handle_t *);
+extern nvlist_t *zfs_get_recvd_props(zfs_handle_t *);
 
 typedef struct zprop_list {
 	int		pl_prop;
@@ -398,10 +423,11 @@ typedef struct zprop_list {
 	struct zprop_list *pl_next;
 	boolean_t	pl_all;
 	size_t		pl_width;
+	size_t		pl_recvd_width;
 	boolean_t	pl_fixed;
 } zprop_list_t;
 
-extern int zfs_expand_proplist(zfs_handle_t *, zprop_list_t **);
+extern int zfs_expand_proplist(zfs_handle_t *, zprop_list_t **, boolean_t);
 extern void zfs_prune_proplist(zfs_handle_t *, uint8_t *);
 
 #define	ZFS_MOUNTPOINT_NONE	"none"
@@ -425,13 +451,24 @@ extern int zprop_get_list(libzfs_handle_t *, char *, zprop_list_t **,
     zfs_type_t);
 extern void zprop_free_list(zprop_list_t *);
 
+#define	ZFS_GET_NCOLS	5
+
+typedef enum {
+	GET_COL_NONE,
+	GET_COL_NAME,
+	GET_COL_PROPERTY,
+	GET_COL_VALUE,
+	GET_COL_RECVD,
+	GET_COL_SOURCE
+} zfs_get_column_t;
+
 /*
  * Functions for printing zfs or zpool properties
  */
 typedef struct zprop_get_cbdata {
 	int cb_sources;
-	int cb_columns[4];
-	int cb_colwidths[5];
+	zfs_get_column_t cb_columns[ZFS_GET_NCOLS];
+	int cb_colwidths[ZFS_GET_NCOLS + 1];
 	boolean_t cb_scripted;
 	boolean_t cb_literal;
 	boolean_t cb_first;
@@ -440,12 +477,8 @@ typedef struct zprop_get_cbdata {
 } zprop_get_cbdata_t;
 
 void zprop_print_one_property(const char *, zprop_get_cbdata_t *,
-    const char *, const char *, zprop_source_t, const char *);
-
-#define	GET_COL_NAME		1
-#define	GET_COL_PROPERTY	2
-#define	GET_COL_VALUE		3
-#define	GET_COL_SOURCE		4
+    const char *, const char *, zprop_source_t, const char *,
+    const char *);
 
 /*
  * Iterator functions.
@@ -470,16 +503,41 @@ extern int zfs_clone(zfs_handle_t *, const char *, nvlist_t *);
 extern int zfs_snapshot(libzfs_handle_t *, const char *, boolean_t, nvlist_t *);
 extern int zfs_rollback(zfs_handle_t *, zfs_handle_t *, boolean_t);
 extern int zfs_rename(zfs_handle_t *, const char *, boolean_t);
+
+typedef struct sendflags {
+	/* print informational messages (ie, -v was specified) */
+	int verbose : 1;
+
+	/* recursive send  (ie, -R) */
+	int replicate : 1;
+
+	/* for incrementals, do all intermediate snapshots */
+	int doall : 1; /* (ie, -I) */
+
+	/* if dataset is a clone, do incremental from its origin */
+	int fromorigin : 1;
+
+	/* do deduplication */
+	int dedup : 1;
+
+	/* send properties (ie, -p) */
+	int props : 1;
+} sendflags_t;
+
+typedef boolean_t (snapfilter_cb_t)(zfs_handle_t *, void *);
+
 extern int zfs_send(zfs_handle_t *, const char *, const char *,
-    boolean_t, boolean_t, boolean_t, boolean_t, int);
+    sendflags_t, int, snapfilter_cb_t, void *);
+
 extern int zfs_promote(zfs_handle_t *);
 extern int zfs_hold(zfs_handle_t *, const char *, const char *, boolean_t,
-    boolean_t);
+    boolean_t, boolean_t);
 extern int zfs_hold_range(zfs_handle_t *, const char *, const char *,
-    const char *, boolean_t);
+    const char *, boolean_t, boolean_t, snapfilter_cb_t, void *);
 extern int zfs_release(zfs_handle_t *, const char *, const char *, boolean_t);
 extern int zfs_release_range(zfs_handle_t *, const char *, const char *,
-    const char *);
+    const char *, boolean_t);
+extern uint64_t zvol_volsize_to_reservation(uint64_t, nvlist_t *);
 
 typedef int (*zfs_userspace_cb_t)(void *arg, const char *domain,
     uid_t rid, uint64_t space);
@@ -493,6 +551,12 @@ typedef struct recvflags {
 
 	/* the destination is a prefix, not the exact fs (ie, -d) */
 	int isprefix : 1;
+
+	/*
+	 * Only the tail of the sent snapshot path is appended to the
+	 * destination to determine the received snapshot name (ie, -e).
+	 */
+	int istail : 1;
 
 	/* do not actually do the recv, just check if it would work (ie, -n) */
 	int dryrun : 1;
@@ -554,10 +618,6 @@ extern int zfs_unshareall_nfs(zfs_handle_t *);
 extern int zfs_unshareall_smb(zfs_handle_t *);
 extern int zfs_unshareall_bypath(zfs_handle_t *, const char *);
 extern int zfs_unshareall(zfs_handle_t *);
-extern boolean_t zfs_is_shared_iscsi(zfs_handle_t *);
-extern int zfs_share_iscsi(zfs_handle_t *);
-extern int zfs_unshare_iscsi(zfs_handle_t *);
-extern int zfs_iscsi_perm_check(libzfs_handle_t *, char *, ucred_t *);
 extern int zfs_deleg_share_nfs(libzfs_handle_t *, char *, char *, char *,
     void *, void *, int, zfs_share_op_t);
 

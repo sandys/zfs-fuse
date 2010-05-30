@@ -62,8 +62,17 @@ extern "C" {
 #include <sys/sysevent/eventdefs.h>
 // #include <sys/sysevent/dev.h>
 #include <sys/fm/util.h>
+#include <sys/sunddi.h>
 
-#define	CPU_SEQID (thr_self() & (max_ncpus - 1))
+// #define	CPU_SEQID (thr_self() & (max_ncpus - 1))
+/* zfs-fuse : this CPU_SEQID macro is used to enter a mutex
+ * for a cpu group. Wonder if it's safe in zfs-fuse ?
+ * Here it seems to assume that threads are assigned sequentially to
+ * all the cpus. I prefer to return 0 for this now... */
+#define CPU_SEQID 0
+
+extern char *kmem_asprintf(const char *fmt, ...);
+#define	strfree(str) kmem_free((str), strlen(str)+1)
 
 #ifdef	__cplusplus
 }

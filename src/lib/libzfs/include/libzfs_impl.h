@@ -20,7 +20,7 @@
  */
 
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -94,6 +94,7 @@ struct zfs_handle {
 	dmu_objset_stats_t zfs_dmustats;
 	nvlist_t *zfs_props;
 	nvlist_t *zfs_user_props;
+	nvlist_t *zfs_recvd_props;
 	boolean_t zfs_mntcheck;
 	char *zfs_mntopts;
 	uint8_t *zfs_props_table;
@@ -129,7 +130,6 @@ typedef  enum {
  */
 typedef enum {
 	SHARED_NOT_SHARED = 0x0,
-	SHARED_ISCSI = 0x1,
 	SHARED_NFS = 0x2,
 	SHARED_SMB = 0x4
 } zfs_share_type_t;

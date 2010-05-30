@@ -101,7 +101,7 @@
  * (successfully or not), zfs_ereport_finish_checksum() is called with the
  * good and bad versions of the buffer (if available), and we annotate the
  * ereport with information about the differences.
-   */
+ */
 #ifdef _KERNEL
 static void
 zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
@@ -119,8 +119,8 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 	 * If we are doing a spa_tryimport() or in recovery mode,
 	 * ignore errors.
 	 */
-	if (spa->spa_load_state == SPA_LOAD_TRYIMPORT ||
-	    spa->spa_load_state == SPA_LOAD_RECOVER)
+	if (spa_load_state(spa) == SPA_LOAD_TRYIMPORT ||
+	    spa_load_state(spa) == SPA_LOAD_RECOVER)
 		return;
 
 	/*
@@ -128,7 +128,7 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 	 * failed, don't bother logging any new ereports - we're just going to
 	 * get the same diagnosis anyway.
 	 */
-	if (spa->spa_load_state != SPA_LOAD_NONE &&
+	if (spa_load_state(spa) != SPA_LOAD_NONE &&
 	    spa->spa_last_open_failed)
 		return;
 
@@ -209,7 +209,7 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 	 * state, use a SPA-wide ENA.  Otherwise, if we are in an I/O state, use
 	 * a root zio-wide ENA.  Otherwise, simply use a unique ENA.
 	 */
-	if (spa->spa_load_state != SPA_LOAD_NONE) {
+	if (spa_load_state(spa) != SPA_LOAD_NONE) {
 		if (spa->spa_ena == 0)
 			spa->spa_ena = fm_ena_generate(0, FM_ENA_FMT1);
 		ena = spa->spa_ena;
@@ -245,7 +245,7 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 	    DATA_TYPE_STRING, spa_name(spa), FM_EREPORT_PAYLOAD_ZFS_POOL_GUID,
 	    DATA_TYPE_UINT64, spa_guid(spa),
 	    FM_EREPORT_PAYLOAD_ZFS_POOL_CONTEXT, DATA_TYPE_INT32,
-	    spa->spa_load_state, NULL);
+	    spa_load_state(spa), NULL);
 
 	if (spa != NULL) {
 		fm_payload_set(ereport, FM_EREPORT_PAYLOAD_ZFS_POOL_FAILMODE,
@@ -508,7 +508,7 @@ annotate_ecksum(nvlist_t *ereport, zio_bad_cksum_t *info,
     const uint8_t *goodbuf, const uint8_t *badbuf, size_t size,
     boolean_t drop_if_identical)
 {
-    syslog(LOG_WARNING,"annotate_ecksum disabled");
+    // syslog(LOG_WARNING,"annotate_ecksum disabled");
     return NULL;
 #if 0
 	const uint64_t *good = (const uint64_t *)goodbuf;
@@ -677,7 +677,7 @@ void
 zfs_ereport_post(const char *subclass, spa_t *spa, vdev_t *vd, zio_t *zio,
     uint64_t stateoroffset, uint64_t size)
 {
-    syslog(LOG_WARNING,"zfs_ereport_post disabled");
+    // syslog(LOG_WARNING,"zfs_ereport_post disabled");
 #if 0
 #ifdef _KERNEL
 	nvlist_t *ereport = NULL;
@@ -739,7 +739,7 @@ void
 zfs_ereport_finish_checksum(zio_cksum_report_t *report,
     const void *good_data, const void *bad_data, boolean_t drop_if_identical)
 {
-    syslog(LOG_WARNING,"zfs_ereport_finish_checksum disabled");
+    // syslog(LOG_WARNING,"zfs_ereport_finish_checksum disabled");
 #if 0
 #ifdef _KERNEL
 	zfs_ecksum_info_t *info = NULL;
@@ -762,7 +762,7 @@ zfs_ereport_finish_checksum(zio_cksum_report_t *report,
 void
 zfs_ereport_free_checksum(zio_cksum_report_t *rpt)
 {
-    syslog(LOG_WARNING,"zfs_ereport_free_checksum disabled");
+    // syslog(LOG_WARNING,"zfs_ereport_free_checksum disabled");
 #if 0
 #ifdef _KERNEL
 	if (rpt->zcr_ereport != NULL) {
@@ -784,7 +784,7 @@ zfs_ereport_free_checksum(zio_cksum_report_t *rpt)
 void
 zfs_ereport_send_interim_checksum(zio_cksum_report_t *report)
 {
-    syslog(LOG_WARNING,"zfs_ereport_send_interim_checksum disabled");
+    // syslog(LOG_WARNING,"zfs_ereport_send_interim_checksum disabled");
 #if 0
 #ifdef _KERNEL
 	fm_ereport_post(report->zcr_ereport, EVCH_SLEEP);
@@ -797,7 +797,7 @@ zfs_ereport_post_checksum(spa_t *spa, vdev_t *vd,
     struct zio *zio, uint64_t offset, uint64_t length,
     const void *good_data, const void *bad_data, zio_bad_cksum_t *zbc)
 {
-    syslog(LOG_WARNING,"zfs_ereport_post_checksum disabled");
+    // syslog(LOG_WARNING,"zfs_ereport_post_checksum disabled");
 #if 0
 #ifdef _KERNEL
 	nvlist_t *ereport = NULL;
@@ -832,7 +832,7 @@ zfs_post_common(spa_t *spa, vdev_t *vd, const char *name)
 	nvlist_t *resource;
 	char class[64];
 
-	if (spa->spa_load_state == SPA_LOAD_TRYIMPORT)
+	if (spa_load_state(spa) == SPA_LOAD_TRYIMPORT)
 		return;
 
 	if ((resource = fm_nvlist_create(NULL)) == NULL)

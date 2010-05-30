@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -40,6 +40,7 @@
 #include <sys/zil.h>
 #include <sys/dmu_impl.h>
 #include <sys/zfs_ioctl.h>
+#include <sys/sunddi.h>
 
 spa_t *
 dmu_objset_spa(objset_t *os)
@@ -728,6 +729,7 @@ dmu_objset_destroy(const char *name, boolean_t defer)
 	 * structure.  Only the ZIL knows how to free them, so we have
 	 * to call into it here.
 	 */
+	sync();
 	error = dsl_dataset_own(name, B_TRUE, FTAG, &ds);
 	if (error == 0) {
 		objset_t *os;
@@ -744,7 +746,7 @@ struct snaparg {
 	dsl_sync_task_group_t *dstg;
 	char *snapname;
 	char failed[MAXPATHLEN];
-	boolean_t checkperms;
+	boolean_t recursive;
 	nvlist_t *props;
 };
 
@@ -769,36 +771,55 @@ snapshot_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 
 	dsl_dataset_snapshot_sync(ds, sn->snapname, cr, tx);
 
-	if (sn->props)
-		dsl_props_set_sync(ds->ds_prev, sn->props, cr, tx);
+	if (sn->props) {
+		dsl_props_arg_t pa;
+		pa.pa_props = sn->props;
+		pa.pa_source = ZPROP_SRC_LOCAL;
+		dsl_props_set_sync(ds->ds_prev, &pa, cr, tx);
+	}
 }
 
 static int
-dmu_objset_snapshot_one(char *name, void *arg)
+dmu_objset_snapshot_one(const char *name, void *arg)
 {
 	struct snaparg *sn = arg;
 	objset_t *os;
 	int err;
+	char *cp;
+
+	/*
+	 * If the objset starts with a '%', then ignore it unless it was
+	 * explicitly named (ie, not recursive).  These hidden datasets
+	 * are always inconsistent, and by not opening them here, we can
+	 * avoid a race with dsl_dir_destroy_check().
+	 */
+	cp = strrchr(name, '/');
+	if (cp && cp[1] == '%' && sn->recursive)
+		return (0);
 
 	(void) strcpy(sn->failed, name);
 
 	/*
-	 * Check permissions only when requested.  This only applies when
-	 * doing a recursive snapshot.  The permission checks for the starting
-	 * dataset have already been performed in zfs_secpolicy_snapshot()
+	 * Check permissions if we are doing a recursive snapshot.  The
+	 * permission checks for the starting dataset have already been
+	 * performed in zfs_secpolicy_snapshot()
 	 */
-	if (sn->checkperms == B_TRUE &&
-	    (err = zfs_secpolicy_snapshot_perms(name, CRED())))
+	if (sn->recursive && (err = zfs_secpolicy_snapshot_perms(name, CRED())))
 		return (err);
 
 	err = dmu_objset_hold(name, sn, &os);
 	if (err != 0)
 		return (err);
 
-	/* If the objset is in an inconsistent state, return busy */
+	/*
+	 * If the objset is in an inconsistent state (eg, in the process
+	 * of being destroyed), don't snapshot it.  As with %hidden
+	 * datasets, we return EBUSY if this name was explicitly
+	 * requested (ie, not recursive), and otherwise ignore it.
+	 */
 	if (os->os_dsl_dataset->ds_phys->ds_flags & DS_FLAG_INCONSISTENT) {
 		dmu_objset_rele(os, sn);
-		return (EBUSY);
+		return (sn->recursive ? 0 : EBUSY);
 	}
 
 	/*
@@ -835,13 +856,12 @@ dmu_objset_snapshot(char *fsname, char *snapname,
 	sn.dstg = dsl_sync_task_group_create(spa_get_dsl(spa));
 	sn.snapname = snapname;
 	sn.props = props;
+	sn.recursive = recursive;
 
 	if (recursive) {
-		sn.checkperms = B_TRUE;
 		err = dmu_objset_find(fsname,
 		    dmu_objset_snapshot_one, &sn, DS_FIND_CHILDREN);
 	} else {
-		sn.checkperms = B_FALSE;
 		err = dmu_objset_snapshot_one(fsname, &sn);
 	}
 
@@ -1310,7 +1330,7 @@ dmu_dir_list_next(objset_t *os, int namelen, char *name,
 }
 
 struct findarg {
-	int (*func)(char *, void *);
+	int (*func)(const char *, void *);
 	void *arg;
 };
 
@@ -1319,7 +1339,7 @@ static int
 findfunc(spa_t *spa, uint64_t dsobj, const char *dsname, void *arg)
 {
 	struct findarg *fa = arg;
-	return (fa->func((char *)dsname, fa->arg));
+	return (fa->func(dsname, fa->arg));
 }
 
 /*
@@ -1327,7 +1347,8 @@ findfunc(spa_t *spa, uint64_t dsobj, const char *dsname, void *arg)
  * Perhaps change all callers to use dmu_objset_find_spa()?
  */
 int
-dmu_objset_find(char *name, int func(char *, void *), void *arg, int flags)
+dmu_objset_find(char *name, int func(const char *, void *), void *arg,
+    int flags)
 {
 	struct findarg fa;
 	fa.func = func;
@@ -1378,12 +1399,9 @@ dmu_objset_find_spa(spa_t *spa, const char *name,
 			ASSERT(attr->za_integer_length == sizeof (uint64_t));
 			ASSERT(attr->za_num_integers == 1);
 
-			child = kmem_alloc(MAXPATHLEN, KM_SLEEP);
-			(void) strcpy(child, name);
-			(void) strcat(child, "/");
-			(void) strcat(child, attr->za_name);
+			child = kmem_asprintf("%s/%s", name, attr->za_name);
 			err = dmu_objset_find_spa(spa, child, func, arg, flags);
-			kmem_free(child, MAXPATHLEN);
+			strfree(child);
 			if (err)
 				break;
 		}
@@ -1417,13 +1435,11 @@ dmu_objset_find_spa(spa_t *spa, const char *name,
 				    sizeof (uint64_t));
 				ASSERT(attr->za_num_integers == 1);
 
-				child = kmem_alloc(MAXPATHLEN, KM_SLEEP);
-				(void) strcpy(child, name);
-				(void) strcat(child, "@");
-				(void) strcat(child, attr->za_name);
+				child = kmem_asprintf("%s@%s",
+				    name, attr->za_name);
 				err = func(spa, attr->za_first_integer,
 				    child, arg);
-				kmem_free(child, MAXPATHLEN);
+				strfree(child);
 				if (err)
 					break;
 			}
@@ -1446,7 +1462,7 @@ dmu_objset_find_spa(spa_t *spa, const char *name,
 
 /* ARGSUSED */
 int
-dmu_objset_prefetch(char *name, void *arg)
+dmu_objset_prefetch(const char *name, void *arg)
 {
 	dsl_dataset_t *ds;
 

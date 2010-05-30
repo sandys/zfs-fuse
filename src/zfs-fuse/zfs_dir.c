@@ -114,6 +114,8 @@ zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, char *name, boolean_t exact,
  *		  ZCIEXACT: On a purely case-insensitive file system,
  *			    this lookup should be case-sensitive.
  *		  ZRENAMING: we are locking for renaming, force narrow locks
+ *		  ZHAVELOCK: Don't grab the z_name_lock for this call. The
+ *			     current thread already holds it.
  *
  * Output arguments:
  *	zpp	- pointer to the znode for the entry (NULL if there isn't one)
@@ -208,13 +210,20 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 
 	/*
 	 * Wait until there are no locks on this name.
+	 *
+	 * Don't grab the the lock if it is already held. However, cannot
+	 * have both ZSHARED and ZHAVELOCK together.
 	 */
-	rw_enter(&dzp->z_name_lock, RW_READER);
+	ASSERT(!(flag & ZSHARED) || !(flag & ZHAVELOCK));
+	if (!(flag & ZHAVELOCK))
+		rw_enter(&dzp->z_name_lock, RW_READER);
+
 	mutex_enter(&dzp->z_lock);
 	for (;;) {
 		if (dzp->z_unlinked) {
 			mutex_exit(&dzp->z_lock);
-			rw_exit(&dzp->z_name_lock);
+			if (!(flag & ZHAVELOCK))
+				rw_exit(&dzp->z_name_lock);
 			return (ENOENT);
 		}
 		for (dl = dzp->z_dirlocks; dl != NULL; dl = dl->dl_next) {
@@ -224,7 +233,8 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 		}
 		if (error != 0) {
 			mutex_exit(&dzp->z_lock);
-			rw_exit(&dzp->z_name_lock);
+			if (!(flag & ZHAVELOCK))
+				rw_exit(&dzp->z_name_lock);
 			return (ENOENT);
 		}
 		if (dl == NULL)	{
@@ -235,6 +245,7 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 			cv_init(&dl->dl_cv, NULL, CV_DEFAULT, NULL);
 			dl->dl_name = name;
 			dl->dl_sharecnt = 0;
+			dl->dl_namelock = 0;
 			dl->dl_namesize = 0;
 			dl->dl_dzp = dzp;
 			dl->dl_next = dzp->z_dirlocks;
@@ -245,6 +256,12 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 			break;
 		cv_wait(&dl->dl_cv, &dzp->z_lock);
 	}
+
+	/*
+	 * If the z_name_lock was NOT held for this dirlock record it.
+	 */
+	if (flag & ZHAVELOCK)
+		dl->dl_namelock = 1;
 
 	if ((flag & ZSHARED) && ++dl->dl_sharecnt > 1 && dl->dl_namesize == 0) {
 		/*
@@ -301,7 +318,7 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 			zfs_dirent_unlock(dl);
 			return (EEXIST);
 		}
-		error = zfs_zget(zfsvfs, zoid, zpp);
+		error = zfs_zget(zfsvfs, zoid, zpp, B_FALSE);
 		if (error) {
 			zfs_dirent_unlock(dl);
 			return (error);
@@ -325,7 +342,10 @@ zfs_dirent_unlock(zfs_dirlock_t *dl)
 	zfs_dirlock_t **prev_dl, *cur_dl;
 
 	mutex_enter(&dzp->z_lock);
-	rw_exit(&dzp->z_name_lock);
+
+	if (!dl->dl_namelock)
+		rw_exit(&dzp->z_name_lock);
+
 	if (dl->dl_sharecnt > 1) {
 		dl->dl_sharecnt--;
 		mutex_exit(&dzp->z_lock);
@@ -377,7 +397,7 @@ zfs_dirlook(znode_t *dzp, char *name, vnode_t **vpp, int flags,
 			return (error);
 		}
 		rw_enter(&dzp->z_parent_lock, RW_READER);
-		error = zfs_zget(zfsvfs, dzp->z_phys->zp_parent, &zp);
+		error = zfs_zget(zfsvfs, dzp->z_phys->zp_parent, &zp, B_FALSE);
 		if (error == 0)
 			*vpp = ZTOV(zp);
 		rw_exit(&dzp->z_parent_lock);
@@ -466,7 +486,7 @@ zfs_unlinked_drain(zfsvfs_t *zfsvfs)
 		 * We need to re-mark these list entries for deletion,
 		 * so we pull them back into core and set zp->z_unlinked.
 		 */
-		error = zfs_zget(zfsvfs, zap.za_first_integer, &zp);
+		error = zfs_zget(zfsvfs, zap.za_first_integer, &zp, B_FALSE);
 
 		/*
 		 * We may pick up znodes that are already marked for deletion.
@@ -510,7 +530,7 @@ zfs_purgedir(znode_t *dzp)
 	    (error = zap_cursor_retrieve(&zc, &zap)) == 0;
 	    zap_cursor_advance(&zc)) {
 		error = zfs_zget(zfsvfs,
-		    ZFS_DIRENT_OBJ(zap.za_first_integer), &xzp);
+		    ZFS_DIRENT_OBJ(zap.za_first_integer), &xzp, B_FALSE);
 		if (error) {
 			skipped += 1;
 			continue;
@@ -594,7 +614,7 @@ zfs_rmnode(znode_t *zp)
 	 * the xattr dir.
 	 */
 	if (zp->z_phys->zp_xattr) {
-		error = zfs_zget(zfsvfs, zp->z_phys->zp_xattr, &xzp);
+		error = zfs_zget(zfsvfs, zp->z_phys->zp_xattr, &xzp, B_FALSE);
 		ASSERT(error == 0);
 	}
 

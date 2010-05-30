@@ -19,11 +19,9 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
-
-/* #pragma ident	"%Z%%M%	%I%	%E% SMI" */
 
 #include <sys/types.h>
 #include <sys/param.h>
@@ -129,6 +127,8 @@ zfs_replay_xvattr(lr_attr_t *lrattr, xvattr_t *xvap)
 		ZFS_TIME_DECODE(&xoap->xoa_createtime, crtime);
 	if (XVA_ISSET_REQ(xvap, XAT_AV_SCANSTAMP))
 		bcopy(scanstamp, xoap->xoa_av_scanstamp, AV_SCANSTAMP_SZ);
+	if (XVA_ISSET_REQ(xvap, XAT_REPARSE))
+		xoap->xoa_reparse = ((*attrs & XAT0_REPARSE) != 0);
 }
 
 static int
@@ -275,9 +275,9 @@ zfs_replay_create_acl(zfsvfs_t *zfsvfs,
 	uint64_t txtype;
 	int error;
 
+	txtype = (lr->lr_common.lrc_txtype & ~TX_CI);
 	if (byteswap) {
 		byteswap_uint64_array(lracl, sizeof (*lracl));
-		txtype = (int)lr->lr_common.lrc_txtype;
 		if (txtype == TX_CREATE_ACL_ATTR ||
 		    txtype == TX_MKDIR_ACL_ATTR) {
 			lrattr = (lr_attr_t *)(caddr_t)(lracl + 1);
@@ -295,7 +295,7 @@ zfs_replay_create_acl(zfsvfs_t *zfsvfs,
 		}
 	}
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp, B_FALSE)) != 0)
 		return (error);
 
 	xva_init(&xva);
@@ -318,7 +318,7 @@ zfs_replay_create_acl(zfsvfs_t *zfsvfs,
 
 	if (lr->lr_common.lrc_txtype & TX_CI)
 		vflg |= FIGNORECASE;
-	switch ((int)lr->lr_common.lrc_txtype) {
+	switch (txtype) {
 	case TX_CREATE_ACL:
 		aclstart = (caddr_t)(lracl + 1);
 		fuidstart = (caddr_t)aclstart +
@@ -391,7 +391,8 @@ bail:
 
 	VN_RELE(ZTOV(dzp));
 
-	zfs_fuid_info_free(zfsvfs->z_fuid_replay);
+	if (zfsvfs->z_fuid_replay)
+		zfs_fuid_info_free(zfsvfs->z_fuid_replay);
 	zfsvfs->z_fuid_replay = NULL;
 
 	return (error);
@@ -413,15 +414,15 @@ zfs_replay_create(zfsvfs_t *zfsvfs, lr_create_t *lr, boolean_t byteswap)
 	uint64_t txtype;
 	int error;
 
+	txtype = (lr->lr_common.lrc_txtype & ~TX_CI);
 	if (byteswap) {
 		byteswap_uint64_array(lr, sizeof (*lr));
-		txtype = (int)lr->lr_common.lrc_txtype;
 		if (txtype == TX_CREATE_ATTR || txtype == TX_MKDIR_ATTR)
 			zfs_replay_swap_attrs((lr_attr_t *)(lr + 1));
 	}
 
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp, B_FALSE)) != 0)
 		return (error);
 
 	xva_init(&xva);
@@ -460,7 +461,7 @@ zfs_replay_create(zfsvfs_t *zfsvfs, lr_create_t *lr, boolean_t byteswap)
 		    lr->lr_uid, lr->lr_gid);
 	}
 
-	switch ((int)lr->lr_common.lrc_txtype) {
+	switch (txtype) {
 	case TX_CREATE_ATTR:
 		lrattr = (lr_attr_t *)(caddr_t)(lr + 1);
 		xvatlen = ZIL_XVAT_SIZE(lrattr->lr_attr_masksize);
@@ -533,7 +534,7 @@ zfs_replay_remove(zfsvfs_t *zfsvfs, lr_remove_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp, B_FALSE)) != 0)
 		return (error);
 
 	if (lr->lr_common.lrc_txtype & TX_CI)
@@ -566,10 +567,10 @@ zfs_replay_link(zfsvfs_t *zfsvfs, lr_link_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp, B_FALSE)) != 0)
 		return (error);
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_link_obj, &zp)) != 0) {
+	if ((error = zfs_zget(zfsvfs, lr->lr_link_obj, &zp, B_FALSE)) != 0) {
 		VN_RELE(ZTOV(dzp));
 		return (error);
 	}
@@ -597,10 +598,10 @@ zfs_replay_rename(zfsvfs_t *zfsvfs, lr_rename_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_sdoid, &sdzp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_sdoid, &sdzp, B_FALSE)) != 0)
 		return (error);
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_tdoid, &tdzp)) != 0) {
+	if ((error = zfs_zget(zfsvfs, lr->lr_tdoid, &tdzp, B_FALSE)) != 0) {
 		VN_RELE(ZTOV(sdzp));
 		return (error);
 	}
@@ -629,7 +630,7 @@ zfs_replay_write(zfsvfs_t *zfsvfs, lr_write_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0) {
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0) {
 		/*
 		 * As we can log writes out of order, it's possible the
 		 * file has been removed. In this case just drop the write
@@ -690,7 +691,7 @@ zfs_replay_write2(zfsvfs_t *zfsvfs, lr_write_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0)
 		return (error);
 
 	end = lr->lr_offset + lr->lr_length;
@@ -714,7 +715,7 @@ zfs_replay_truncate(zfsvfs_t *zfsvfs, lr_truncate_t *lr, boolean_t byteswap)
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0)
 		return (error);
 
 	bzero(&fl, sizeof (fl));
@@ -749,7 +750,7 @@ zfs_replay_setattr(zfsvfs_t *zfsvfs, lr_setattr_t *lr, boolean_t byteswap)
 			zfs_replay_swap_attrs((lr_attr_t *)(lr + 1));
 	}
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0)
 		return (error);
 
 	zfs_init_vattr(vap, lr->lr_mask, lr->lr_mode,
@@ -796,7 +797,7 @@ zfs_replay_acl_v0(zfsvfs_t *zfsvfs, lr_acl_v0_t *lr, boolean_t byteswap)
 		zfs_oldace_byteswap(ace, lr->lr_aclcnt);
 	}
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0)
 		return (error);
 
 	bzero(&vsa, sizeof (vsa));
@@ -845,7 +846,7 @@ zfs_replay_acl(zfsvfs_t *zfsvfs, lr_acl_t *lr, boolean_t byteswap)
 		}
 	}
 
-	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp)) != 0)
+	if ((error = zfs_zget(zfsvfs, lr->lr_foid, &zp, B_FALSE)) != 0)
 		return (error);
 
 	bzero(&vsa, sizeof (vsa));

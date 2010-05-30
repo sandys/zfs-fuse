@@ -710,7 +710,6 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz)
  *		flag	- flags:
  *			  IS_ROOT_NODE	- new object will be root
  *			  IS_XATTR	- new object is an attribute
- *			  IS_REPLAY	- intent log replay
  *		bonuslen - length of bonus buffer
  *		setaclp  - File/Dir initial ACL
  *		fuidp	 - Tracks fuid allocation.
@@ -733,7 +732,6 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 
 	if (zfsvfs->z_replay) {
 		obj = vap->va_nodeid;
-		flag |= IS_REPLAY;
 		now = vap->va_ctime;		/* see zfs_replay_create() */
 		gen = vap->va_nblocks;		/* ditto */
 	} else {
@@ -752,7 +750,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	 * assertions below.
 	 */
 	if (vap->va_type == VDIR) {
-		if (flag & IS_REPLAY) {
+		if (zfsvfs->z_replay) {
 			err = zap_create_claim_norm(zfsvfs->z_os, obj,
 			    zfsvfs->z_norm, DMU_OT_DIRECTORY_CONTENTS,
 			    DMU_OT_ZNODE, sizeof (znode_phys_t) + bonuslen, tx);
@@ -763,7 +761,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 			    DMU_OT_ZNODE, sizeof (znode_phys_t) + bonuslen, tx);
 		}
 	} else {
-		if (flag & IS_REPLAY) {
+		if (zfsvfs->z_replay) {
 			err = dmu_object_claim(zfsvfs->z_os, obj,
 			    DMU_OT_PLAIN_FILE_CONTENTS, 0,
 			    DMU_OT_ZNODE, sizeof (znode_phys_t) + bonuslen, tx);
@@ -916,16 +914,14 @@ zfs_xvattr_set(znode_t *zp, xvattr_t *xvap)
 		zp->z_phys->zp_flags |= ZFS_BONUS_SCANSTAMP;
 		XVA_SET_RTN(xvap, XAT_AV_SCANSTAMP);
 	}
-	/* for later use...
 	if (XVA_ISSET_REQ(xvap, XAT_REPARSE)) {
 		ZFS_ATTR_SET(zp, ZFS_REPARSE, xoap->xoa_reparse);
 		XVA_SET_RTN(xvap, XAT_REPARSE);
 	}
-	*/
 }
 
 int
-zfs_zget(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp)
+zfs_zget(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp, boolean_t zget_unlinked)
 {
 	dmu_object_info_t doi;
 	dmu_buf_t	*db;
@@ -961,8 +957,8 @@ zfs_zget(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp)
 		 */
 		ASSERT3P(zp->z_dbuf, ==, db);
 		ASSERT3U(zp->z_id, ==, obj_num);
-		if (zp->z_unlinked) {
-			err = ENOENT;
+		if (zp->z_unlinked && !zget_unlinked) {
+            err = ENOENT;
 		} else {
 			VN_HOLD(ZTOV(zp));
 			*zpp = zp;
