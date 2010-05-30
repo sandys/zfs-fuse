@@ -624,6 +624,25 @@ zfs_write(vnode_t *vp, uio_t *uio, int ioflag, cred_t *cr, caller_context_t *ct)
 	zilog = zfsvfs->z_log;
 
 	/*
+	 * Validate file offset
+	 */
+	woff = ioflag & FAPPEND ? zp->z_phys->zp_size : uio->uio_loffset;
+	if (woff < 0) {
+		ZFS_EXIT(zfsvfs);
+		return (EINVAL);
+	}
+
+	/*
+	 * Check for mandatory locks before calling zfs_range_lock()
+	 * in order to prevent a deadlock with locks set via fcntl().
+	 */
+	if (MANDMODE((mode_t)zp->z_phys->zp_mode) &&
+	    (error = chklock(vp, FWRITE, woff, n, uio->uio_fmode, ct)) != 0) {
+		ZFS_EXIT(zfsvfs);
+		return (error);
+	}
+
+	/*
 	 * Pre-fault the pages to ensure slow (eg NFS) pages
 	 * don't hold up txg.
 	 */
@@ -635,34 +654,25 @@ zfs_write(vnode_t *vp, uio_t *uio, int ioflag, cred_t *cr, caller_context_t *ct)
 	 */
 	if (ioflag & FAPPEND) {
 		/*
-		 * Range lock for a file append:
-		 * The value for the start of range will be determined by
-		 * zfs_range_lock() (to guarantee append semantics).
-		 * If this write will cause the block size to increase,
-		 * zfs_range_lock() will lock the entire file, so we must
-		 * later reduce the range after we grow the block size.
+		 * Obtain an appending range lock to guarantee file append
+		 * semantics.  We reset the write offset once we have the lock.
 		 */
 		rl = zfs_range_lock(zp, 0, n, RL_APPEND);
+		woff = rl->r_off;
 		if (rl->r_len == UINT64_MAX) {
-			/* overlocked, zp_size can't change */
-			woff = uio->uio_loffset = zp->z_phys->zp_size;
-		} else {
-			woff = uio->uio_loffset = rl->r_off;
+			/*
+			 * We overlocked the file because this write will cause
+			 * the file block size to increase.
+			 * Note that zp_size cannot change with this lock held.
+			 */
+			woff = zp->z_phys->zp_size;
 		}
+		uio->uio_loffset = woff;
 	} else {
-		woff = uio->uio_loffset;
 		/*
-		 * Validate file offset
-		 */
-		if (woff < 0) {
-			ZFS_EXIT(zfsvfs);
-			return (EINVAL);
-		}
-
-		/*
-		 * If we need to grow the block size then zfs_range_lock()
-		 * will lock a wider range than we request here.
-		 * Later after growing the block size we reduce the range.
+		 * Note that if the file block size will change as a result of
+		 * this write, then this range lock will lock the entire file
+		 * so that we can re-write the block safely.
 		 */
 		rl = zfs_range_lock(zp, woff, n, RL_WRITER);
 	}
@@ -676,15 +686,6 @@ zfs_write(vnode_t *vp, uio_t *uio, int ioflag, cred_t *cr, caller_context_t *ct)
 	if ((woff + n) > limit || woff > (limit - n))
 		n = limit - woff;
 
-	/*
-	 * Check for mandatory locks
-	 */
-	if (MANDMODE((mode_t)zp->z_phys->zp_mode) &&
-	    (error = chklock(vp, FWRITE, woff, n, uio->uio_fmode, ct)) != 0) {
-		zfs_range_unlock(rl);
-		ZFS_EXIT(zfsvfs);
-		return (error);
-	}
 	end_size = MAX(zp->z_phys->zp_size, woff + n);
 
 	/*
@@ -707,6 +708,12 @@ again:
 			break;
 		}
 
+#if 0
+/* zfs-fuse : well there is a serious problem here.
+Using uiocopy right here sends the result to a socket which asked for an ioctl but
+never asked for anything about arc.
+There is clearly a difference here with opensolaris.
+All I can hope is that we can simply disable this code without risk */
 		/*
 		 * If dmu_assign_arcbuf() is expected to execute with minimum
 		 * overhead loan an arc buffer and copy user data to it before
@@ -729,6 +736,7 @@ again:
 			}
 			ASSERT(cbytes == max_blksz);
 		}
+#endif
 
 		/*
 		 * Start a transaction.
@@ -913,7 +921,7 @@ zfs_get_data(void *arg, lr_write_t *lr, char *buf, zio_t *zio)
 	/*
 	 * Nothing to do if the file has been removed
 	 */
-	if (zfs_zget(zfsvfs, object, &zp) != 0)
+	if (zfs_zget(zfsvfs, object, &zp, B_FALSE) != 0)
 		return (ENOENT);
 	if (zp->z_unlinked) {
 		/*
@@ -1146,7 +1154,7 @@ zfs_lookup(vnode_t *dvp, char *nm, vnode_t **vpp, struct pathname *pnp,
 		if (zdp->z_phys->zp_flags & ZFS_XATTR) {
 			ZFS_EXIT(zfsvfs);
 			return (EINVAL);
-		} 
+		}
 
 		if (error = zfs_get_xattrdir(VTOZ(dvp), vpp, cr, flags)) {
 			ZFS_EXIT(zfsvfs);
@@ -1188,8 +1196,8 @@ zfs_lookup(vnode_t *dvp, char *nm, vnode_t **vpp, struct pathname *pnp,
 	}
 
 	error = zfs_dirlook(zdp, nm, vpp, flags, direntflags, realpnp);
- 	if (error == 0)
- 		error = specvp_check(vpp, cr);
+	if (error == 0)
+		error = specvp_check(vpp, cr);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -1426,7 +1434,7 @@ out:
 			VN_RELE(ZTOV(zp));
 	} else {
 		*vpp = ZTOV(zp);
- 		error = specvp_check(vpp, cr);
+		error = specvp_check(vpp, cr);
 	}
 
 	ZFS_EXIT(zfsvfs);
@@ -1585,7 +1593,7 @@ top:
 
 	if (delete_now) {
 		if (zp->z_phys->zp_xattr) {
-			error = zfs_zget(zfsvfs, zp->z_phys->zp_xattr, &xzp);
+			error = zfs_zget(zfsvfs, zp->z_phys->zp_xattr, &xzp, B_FALSE);
 			ASSERT3U(error, ==, 0);
 			ASSERT3U(xzp->z_phys->zp_links, ==, 2);
 			dmu_buf_will_dirty(xzp->z_dbuf, tx);
@@ -2103,7 +2111,7 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, int *eofp,
 			 * this entry in the returned information
 			 */
 			znode_t	*ezp;
-			if (zfs_zget(zp->z_zfsvfs, objnum, &ezp) != 0)
+			if (zfs_zget(zp->z_zfsvfs, objnum, &ezp, B_FALSE) != 0)
 				goto skip_entry;
 			if (!zfs_has_access(ezp, cr)) {
 				VN_RELE(ZTOV(ezp));
@@ -2398,6 +2406,12 @@ zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr,
 		if (XVA_ISSET_REQ(xvap, XAT_CREATETIME)) {
 			ZFS_TIME_DECODE(&xoap->xoa_createtime, pzp->zp_crtime);
 			XVA_SET_RTN(xvap, XAT_CREATETIME);
+		}
+
+		if (XVA_ISSET_REQ(xvap, XAT_REPARSE)) {
+			xoap->xoa_reparse =
+			    ((pzp->zp_flags & ZFS_REPARSE) != 0);
+			XVA_SET_RTN(xvap, XAT_REPARSE);
 		}
 	}
 
@@ -2700,6 +2714,12 @@ top:
 			}
 		}
 
+		if (XVA_ISSET_REQ(xvap, XAT_REPARSE)) {
+			mutex_exit(&zp->z_lock);
+			ZFS_EXIT(zfsvfs);
+			return (EPERM);
+		}
+
 		if (need_policy == FALSE &&
 		    (XVA_ISSET_REQ(xvap, XAT_AV_SCANSTAMP) ||
 		    XVA_ISSET_REQ(xvap, XAT_OPAQUE))) {
@@ -2786,7 +2806,7 @@ top:
 
 	if (mask & (AT_UID | AT_GID)) {
 		if (pzp->zp_xattr) {
-			err = zfs_zget(zp->z_zfsvfs, pzp->zp_xattr, &attrzp);
+			err = zfs_zget(zp->z_zfsvfs, pzp->zp_xattr, &attrzp, B_FALSE);
 			if (err)
 				goto out;
 			dmu_tx_hold_bonus(tx, attrzp->z_id);
@@ -3045,7 +3065,7 @@ zfs_rename_lock(znode_t *szp, znode_t *tdzp, znode_t *sdzp, zfs_zlock_t **zlpp)
 			return (0);
 
 		if (rw == RW_READER) {		/* i.e. not the first pass */
-			int error = zfs_zget(zp->z_zfsvfs, *oidp, &zp);
+			int error = zfs_zget(zp->z_zfsvfs, *oidp, &zp, B_FALSE);
 			if (error)
 				return (error);
 			zl->zl_znode = zp;
@@ -3197,6 +3217,15 @@ top:
 		}
 	}
 
+	/*
+	 * If the source and destination directories are the same, we should
+	 * grab the z_name_lock of that directory only once.
+	 */
+	if (sdzp == tdzp) {
+		zflg |= ZHAVELOCK;
+		rw_enter(&sdzp->z_name_lock, RW_READER);
+	}
+
 	if (cmp < 0) {
 		serr = zfs_dirent_lock(&sdl, sdzp, snm, &szp,
 		    ZEXISTS | zflg, NULL, NULL);
@@ -3219,6 +3248,10 @@ top:
 			if (tzp)
 				VN_RELE(ZTOV(tzp));
 		}
+
+		if (sdzp == tdzp)
+			rw_exit(&sdzp->z_name_lock);
+
 		if (strcmp(snm, "..") == 0)
 			serr = EINVAL;
 		ZFS_EXIT(zfsvfs);
@@ -3227,6 +3260,10 @@ top:
 	if (terr) {
 		zfs_dirent_unlock(sdl);
 		VN_RELE(ZTOV(szp));
+
+		if (sdzp == tdzp)
+			rw_exit(&sdzp->z_name_lock);
+
 		if (strcmp(tnm, "..") == 0)
 			terr = EINVAL;
 		ZFS_EXIT(zfsvfs);
@@ -3309,6 +3346,10 @@ top:
 			zfs_rename_unlock(&zl);
 		zfs_dirent_unlock(sdl);
 		zfs_dirent_unlock(tdl);
+
+		if (sdzp == tdzp)
+			rw_exit(&sdzp->z_name_lock);
+
 		VN_RELE(ZTOV(szp));
 		if (tzp)
 			VN_RELE(ZTOV(tzp));
@@ -3349,6 +3390,10 @@ out:
 
 	zfs_dirent_unlock(sdl);
 	zfs_dirent_unlock(tdl);
+
+	if (sdzp == tdzp)
+		rw_exit(&sdzp->z_name_lock);
+
 
 	VN_RELE(ZTOV(szp));
 	if (tzp)
@@ -4621,20 +4666,6 @@ zfs_isdir()
 {
 	return (EISDIR);
 }
-
-
-static int
-zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr,
-    caller_context_t *ct);
-
-static int
-zfs_setattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr,
-        caller_context_t *ct);
-
-static int
-zfs_rename(vnode_t *sdvp, char *snm, vnode_t *tdvp, char *tnm, cred_t *cr,
-    caller_context_t *ct, int flags);
-
 /*
  * Directory vnode operations template
  */

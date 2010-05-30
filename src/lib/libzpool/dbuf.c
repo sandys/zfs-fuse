@@ -2029,7 +2029,7 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 
 	ASSERT(dmu_tx_is_syncing(tx));
 
-	dprintf_dbuf_bp(db, db->db_blkptr, "blkptr=%p", db->db_blkptr);
+	dprintf_dbuf_bp(db, db->db_blkptr, "blkptr=%p", db->db_blkptr); 
 
 	mutex_enter(&db->db_mtx);
 	/*
@@ -2207,9 +2207,6 @@ dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 		for (i = db->db.db_size >> SPA_BLKPTRSHIFT; i > 0; i--, ibp++) {
 			if (BP_IS_HOLE(ibp))
 				continue;
-			ASSERT3U(BP_GET_LSIZE(ibp), ==,
-			    db->db_level == 1 ? dn->dn_datablksz :
-			    (1<<dn->dn_phys->dn_indblkshift));
 			fill += ibp->blk_fill;
 		}
 	}
@@ -2289,6 +2286,7 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 	db->db_dirtycnt -= 1;
 	db->db_data_pending = NULL;
 	dbuf_rele_and_unlock(db, (void *)(uintptr_t)txg);
+	pthread_yield();
 }
 
 static void

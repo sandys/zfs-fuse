@@ -46,7 +46,7 @@ void
 txg_init(dsl_pool_t *dp, uint64_t txg)
 {
 	tx_state_t *tx = &dp->dp_tx;
-	int c, i;
+	int c;
 	bzero(tx, sizeof (tx_state_t));
 
 	tx->tx_cpu = kmem_zalloc(max_ncpus * sizeof (tx_cpu_t), KM_SLEEP);
@@ -75,6 +75,19 @@ txg_init(dsl_pool_t *dp, uint64_t txg)
 	tx->tx_open_txg = txg;
 }
 
+static void destroy_callbacks(list_t *cb_list) {
+    /* zfs-fuse : another thread problem : sometimes ztest closes its dataset
+     * before the threads had time to be called.
+     * In this case a simple list_destroy fails because the list still contains
+     * the callbacks, so this function is here to do the cleanup */
+	dmu_tx_callback_t *dcb;
+
+	while (dcb = list_head(cb_list)) {
+		list_remove(cb_list, dcb);
+		kmem_free(dcb, sizeof (dmu_tx_callback_t));
+	}
+}
+
 /*
  * Close down the txg subsystem.
  */
@@ -82,7 +95,7 @@ void
 txg_fini(dsl_pool_t *dp)
 {
 	tx_state_t *tx = &dp->dp_tx;
-	int c, i;
+	int c;
 
 	ASSERT(tx->tx_threads == 0);
 
@@ -100,6 +113,7 @@ txg_fini(dsl_pool_t *dp)
 		mutex_destroy(&tx->tx_cpu[c].tc_lock);
 		for (i = 0; i < TXG_SIZE; i++) {
 			cv_destroy(&tx->tx_cpu[c].tc_cv[i]);
+			destroy_callbacks(&tx->tx_cpu[c].tc_callbacks[i]);
 			list_destroy(&tx->tx_cpu[c].tc_callbacks[i]);
 		}
 	}
@@ -352,6 +366,7 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 static void
 txg_sync_thread(dsl_pool_t *dp)
 {
+	spa_t *spa = dp->dp_spa;
 	tx_state_t *tx = &dp->dp_tx;
 	callb_cpr_t cpr;
 	uint64_t start, delta;
@@ -370,7 +385,8 @@ txg_sync_thread(dsl_pool_t *dp)
 		 */
 		timer = (delta >= timeout ? 0 : timeout - delta);
 		while ((dp->dp_scrub_func == SCRUB_FUNC_NONE ||
-		    spa_shutting_down(dp->dp_spa)) &&
+		    spa_load_state(spa) != SPA_LOAD_NONE ||
+		    spa_shutting_down(spa)) &&
 		    !tx->tx_exiting && timer > 0 &&
 		    tx->tx_synced_txg >= tx->tx_sync_txg_waiting &&
 		    tx->tx_quiesced_txg == 0) {
@@ -410,7 +426,7 @@ txg_sync_thread(dsl_pool_t *dp)
 		mutex_exit(&tx->tx_sync_lock);
 
 		start = lbolt;
-		spa_sync(dp->dp_spa, txg);
+		spa_sync(spa, txg);
 		delta = lbolt - start;
 
 		mutex_enter(&tx->tx_sync_lock);

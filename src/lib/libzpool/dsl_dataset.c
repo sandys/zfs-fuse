@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -38,7 +38,6 @@
 #include <sys/zfs_ioctl.h>
 #include <sys/spa.h>
 #include <sys/zfs_znode.h>
-#include <sys/sunddi.h>
 #include <sys/zvol.h>
 #include "kmem_asprintf.h"
 
@@ -308,8 +307,6 @@ dsl_dataset_snap_lookup(dsl_dataset_t *ds, const char *name, uint64_t *value)
 	matchtype_t mt;
 	int err;
 
-	dsl_dir_snap_cmtime_update(ds->ds_dir);
-
 	if (ds->ds_phys->ds_flags & DS_FLAG_CI_DATASET)
 		mt = MT_FIRST;
 	else
@@ -329,6 +326,8 @@ dsl_dataset_snap_remove(dsl_dataset_t *ds, char *name, dmu_tx_t *tx)
 	uint64_t snapobj = ds->ds_phys->ds_snapnames_zapobj;
 	matchtype_t mt;
 	int err;
+
+	dsl_dir_snap_cmtime_update(ds->ds_dir);
 
 	if (ds->ds_phys->ds_flags & DS_FLAG_CI_DATASET)
 		mt = MT_FIRST;
@@ -535,7 +534,15 @@ dsl_dataset_hold_ref(dsl_dataset_t *ds, void *tag)
 			rw_enter(&dp->dp_config_rwlock, RW_READER);
 			return (ENOENT);
 		}
+		/*
+		 * The dp_config_rwlock lives above the ds_lock. And
+		 * we need to check DSL_DATASET_IS_DESTROYED() while
+		 * holding the ds_lock, so we have to drop and reacquire
+		 * the ds_lock here.
+		 */
+		mutex_exit(&ds->ds_lock);
 		rw_enter(&dp->dp_config_rwlock, RW_READER);
+		mutex_enter(&ds->ds_lock);
 	}
 	mutex_exit(&ds->ds_lock);
 	return (0);
@@ -858,7 +865,7 @@ struct destroyarg {
 };
 
 static int
-dsl_snapshot_destroy_one(char *name, void *arg)
+dsl_snapshot_destroy_one(const char *name, void *arg)
 {
 	struct destroyarg *da = arg;
 	dsl_dataset_t *ds;
@@ -1007,7 +1014,8 @@ dsl_dataset_destroy(dsl_dataset_t *ds, void *tag, boolean_t defer)
 	objset_t *os;
 	dsl_dir_t *dd;
 	uint64_t obj;
-	struct dsl_ds_destroyarg dsda = {0};
+	struct dsl_ds_destroyarg dsda = { 0 };
+	dsl_dataset_t dummy_ds = { 0 };
 
 	dsda.ds = ds;
 
@@ -1031,6 +1039,8 @@ dsl_dataset_destroy(dsl_dataset_t *ds, void *tag, boolean_t defer)
 	}
 
 	dd = ds->ds_dir;
+	dummy_ds.ds_dir = dd;
+	dummy_ds.ds_object = ds->ds_object;
 
 	/*
 	 * Check for errors and mark this ds as inconsistent, in
@@ -1125,7 +1135,7 @@ dsl_dataset_destroy(dsl_dataset_t *ds, void *tag, boolean_t defer)
 		dsl_sync_task_create(dstg, dsl_dataset_destroy_check,
 		    dsl_dataset_destroy_sync, &dsda, tag, 0);
 		dsl_sync_task_create(dstg, dsl_dir_destroy_check,
-		    dsl_dir_destroy_sync, dd, FTAG, 0);
+		    dsl_dir_destroy_sync, &dummy_ds, FTAG, 0);
 		err = dsl_sync_task_group_wait(dstg);
 		dsl_sync_task_group_destroy(dstg);
 
@@ -1526,8 +1536,15 @@ dsl_dataset_destroy_sync(void *arg1, void *tag, cred_t *cr, dmu_tx_t *tx)
 
 	/* Remove our reservation */
 	if (ds->ds_reserved != 0) {
-		uint64_t val = 0;
-		dsl_dataset_set_reservation_sync(ds, &val, cr, tx);
+		dsl_prop_setarg_t psa;
+		uint64_t value = 0;
+
+		dsl_prop_setarg_init_uint64(&psa, "refreservation",
+		    (ZPROP_SRC_NONE | ZPROP_SRC_LOCAL | ZPROP_SRC_RECEIVED),
+		    &value);
+		psa.psa_effective_value = 0;	/* predict default value */
+
+		dsl_dataset_set_reservation_sync(ds, &psa, cr, tx);
 		ASSERT3U(ds->ds_reserved, ==, 0);
 	}
 
@@ -2021,7 +2038,8 @@ dsl_dataset_stats(dsl_dataset_t *ds, nvlist_t *nv)
 	    dsl_dataset_unique(ds));
 	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_OBJSETID,
 	    ds->ds_object);
-	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_USERREFS, ds->ds_userrefs);
+	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_USERREFS,
+	    ds->ds_userrefs);
 	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_DEFER_DESTROY,
 	    DS_IS_DEFER_DESTROY(ds) ? 1 : 0);
 
@@ -2183,43 +2201,36 @@ struct renamesnaparg {
 };
 
 static int
-dsl_snapshot_rename_one(char *name, void *arg)
+dsl_snapshot_rename_one(const char *name, void *arg)
 {
 	struct renamesnaparg *ra = arg;
 	dsl_dataset_t *ds = NULL;
-	char *cp;
+	char *snapname;
 	int err;
 
-	cp = name + strlen(name);
-	*cp = '@';
-	(void) strcpy(cp + 1, ra->oldsnap);
+	snapname = kmem_asprintf("%s@%s", name, ra->oldsnap);
+	(void) strlcpy(ra->failed, snapname, sizeof (ra->failed));
 
 	/*
 	 * For recursive snapshot renames the parent won't be changing
 	 * so we just pass name for both the to/from argument.
 	 */
-	err = zfs_secpolicy_rename_perms(name, name, CRED());
-	if (err == ENOENT) {
-		return (0);
-	} else if (err) {
-		(void) strcpy(ra->failed, name);
-		return (err);
+	err = zfs_secpolicy_rename_perms(snapname, snapname, CRED());
+	if (err != 0) {
+		strfree(snapname);
+		return (err == ENOENT ? 0 : err);
 	}
 
 #ifdef _KERNEL
 	/*
 	 * For all filesystems undergoing rename, we'll need to unmount it.
 	 */
-	(void) zfs_unmount_snap(name, NULL);
+	(void) zfs_unmount_snap(snapname, NULL);
 #endif
-	err = dsl_dataset_hold(name, ra->dstg, &ds);
-	*cp = '\0';
-	if (err == ENOENT) {
-		return (0);
-	} else if (err) {
-		(void) strcpy(ra->failed, name);
-		return (err);
-	}
+	err = dsl_dataset_hold(snapname, ra->dstg, &ds);
+	strfree(snapname);
+	if (err != 0)
+		return (err == ENOENT ? 0 : err);
 
 	dsl_sync_task_create(ra->dstg, dsl_dataset_snapshot_rename_check,
 	    dsl_dataset_snapshot_rename_sync, ds, ra->newsnap, 0);
@@ -2235,7 +2246,7 @@ dsl_recursive_rename(char *oldname, const char *newname)
 	dsl_sync_task_t *dst;
 	spa_t *spa;
 	char *cp, *fsname = spa_strdup(oldname);
-	int len = strlen(oldname);
+	int len = strlen(oldname) + 1;
 
 	/* truncate the snapshot name to get the fsname */
 	cp = strchr(fsname, '@');
@@ -2243,7 +2254,7 @@ dsl_recursive_rename(char *oldname, const char *newname)
 
 	err = spa_open(fsname, &spa, FTAG);
 	if (err) {
-		kmem_free(fsname, len + 1);
+		kmem_free(fsname, len);
 		return (err);
 	}
 	ra = kmem_alloc(sizeof (struct renamesnaparg), KM_SLEEP);
@@ -2255,7 +2266,7 @@ dsl_recursive_rename(char *oldname, const char *newname)
 
 	err = dmu_objset_find(fsname, dsl_snapshot_rename_one, ra,
 	    DS_FIND_CHILDREN);
-	kmem_free(fsname, len + 1);
+	kmem_free(fsname, len);
 
 	if (err == 0) {
 		err = dsl_sync_task_group_wait(ra->dstg);
@@ -2266,14 +2277,15 @@ dsl_recursive_rename(char *oldname, const char *newname)
 		dsl_dataset_t *ds = dst->dst_arg1;
 		if (dst->dst_err) {
 			dsl_dir_name(ds->ds_dir, ra->failed);
-			(void) strcat(ra->failed, "@");
-			(void) strcat(ra->failed, ra->newsnap);
+			(void) strlcat(ra->failed, "@", sizeof (ra->failed));
+			(void) strlcat(ra->failed, ra->newsnap,
+			    sizeof (ra->failed));
 		}
 		dsl_dataset_rele(ds, ra->dstg);
 	}
 
 	if (err)
-		(void) strcpy(oldname, ra->failed);
+		(void) strlcpy(oldname, ra->failed, sizeof (ra->failed));
 
 	dsl_sync_task_group_destroy(ra->dstg);
 	kmem_free(ra, sizeof (struct renamesnaparg));
@@ -2282,7 +2294,7 @@ dsl_recursive_rename(char *oldname, const char *newname)
 }
 
 static int
-dsl_valid_rename(char *oldname, void *arg)
+dsl_valid_rename(const char *oldname, void *arg)
 {
 	int delta = *(int *)arg;
 
@@ -2304,12 +2316,7 @@ dsl_dataset_rename(char *oldname, const char *newname, boolean_t recursive)
 	err = dsl_dir_open(oldname, FTAG, &dd, &tail);
 	if (err)
 		return (err);
-	/*
-	 * If there are more than 2 references there may be holds
-	 * hanging around that haven't been cleared out yet.
-	 */
-	if (dmu_buf_refcount(dd->dd_dbuf) > 2)
-		txg_wait_synced(dd->dd_pool, 0);
+
 	if (tail == NULL) {
 		int delta = strlen(newname) - strlen(oldname);
 
@@ -2318,11 +2325,12 @@ dsl_dataset_rename(char *oldname, const char *newname, boolean_t recursive)
 			err = dmu_objset_find(oldname, dsl_valid_rename,
 			    &delta, DS_FIND_CHILDREN | DS_FIND_SNAPSHOTS);
 
-		if (!err)
+		if (err == 0)
 			err = dsl_dir_rename(dd, newname);
 		dsl_dir_close(dd, FTAG);
 		return (err);
 	}
+
 	if (tail[0] != '@') {
 		/* the name ended in a nonexistent component */
 		dsl_dir_close(dd, FTAG);
@@ -2429,7 +2437,7 @@ dsl_dataset_promote_check(void *arg1, void *arg2, dmu_tx_t *tx)
 			err = EEXIST;
 			goto out;
 		}
-  		if (err != ENOENT)
+		if (err != ENOENT)
 			goto out;
 
 		/* The very first snapshot does not have a deadlist */
@@ -3083,62 +3091,70 @@ static int
 dsl_dataset_set_quota_check(void *arg1, void *arg2, dmu_tx_t *tx)
 {
 	dsl_dataset_t *ds = arg1;
-	uint64_t *quotap = arg2;
-	uint64_t new_quota = *quotap;
+	dsl_prop_setarg_t *psa = arg2;
+	int err;
 
 	if (spa_version(ds->ds_dir->dd_pool->dp_spa) < SPA_VERSION_REFQUOTA)
 		return (ENOTSUP);
 
-	if (new_quota == 0)
+	if ((err = dsl_prop_predict_sync(ds->ds_dir, psa)) != 0)
+		return (err);
+
+	if (psa->psa_effective_value == 0)
 		return (0);
 
-	if (new_quota < ds->ds_phys->ds_used_bytes ||
-	    new_quota < ds->ds_reserved)
+	if (psa->psa_effective_value < ds->ds_phys->ds_used_bytes ||
+	    psa->psa_effective_value < ds->ds_reserved)
 		return (ENOSPC);
 
 	return (0);
 }
 
-/* ARGSUSED */
+extern void dsl_prop_set_sync(void *, void *, cred_t *, dmu_tx_t *);
+
 void
 dsl_dataset_set_quota_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 {
 	dsl_dataset_t *ds = arg1;
-	uint64_t *quotap = arg2;
-	uint64_t new_quota = *quotap;
+	dsl_prop_setarg_t *psa = arg2;
+	uint64_t effective_value = psa->psa_effective_value;
 
-	dmu_buf_will_dirty(ds->ds_dbuf, tx);
+	dsl_prop_set_sync(ds, psa, cr, tx);
+	DSL_PROP_CHECK_PREDICTION(ds->ds_dir, psa);
 
-	ds->ds_quota = new_quota;
+	if (ds->ds_quota != effective_value) {
+		dmu_buf_will_dirty(ds->ds_dbuf, tx);
+		ds->ds_quota = effective_value;
 
-	dsl_dir_prop_set_uint64_sync(ds->ds_dir, "refquota", new_quota, cr, tx);
-
-	spa_history_internal_log(LOG_DS_REFQUOTA, ds->ds_dir->dd_pool->dp_spa,
-	    tx, cr, "%lld dataset = %llu ",
-	    (longlong_t)new_quota, ds->ds_object);
+		spa_history_internal_log(LOG_DS_REFQUOTA,
+		    ds->ds_dir->dd_pool->dp_spa, tx, cr, "%lld dataset = %llu ",
+		    (longlong_t)ds->ds_quota, ds->ds_object);
+	}
 }
 
 int
-dsl_dataset_set_quota(const char *dsname, uint64_t quota)
+dsl_dataset_set_quota(const char *dsname, zprop_source_t source, uint64_t quota)
 {
 	dsl_dataset_t *ds;
+	dsl_prop_setarg_t psa;
 	int err;
+
+	dsl_prop_setarg_init_uint64(&psa, "refquota", source, &quota);
 
 	err = dsl_dataset_hold(dsname, FTAG, &ds);
 	if (err)
 		return (err);
 
-	if (quota != ds->ds_quota) {
-		/*
-		 * If someone removes a file, then tries to set the quota, we
-		 * want to make sure the file freeing takes effect.
-		 */
-		txg_wait_open(ds->ds_dir->dd_pool, 0);
+	/*
+	 * If someone removes a file, then tries to set the quota, we
+	 * want to make sure the file freeing takes effect.
+	 */
+	txg_wait_open(ds->ds_dir->dd_pool, 0);
 
-		err = dsl_sync_task_do(ds->ds_dir->dd_pool,
-		    dsl_dataset_set_quota_check, dsl_dataset_set_quota_sync,
-		    ds, &quota, 0);
-	}
+	err = dsl_sync_task_do(ds->ds_dir->dd_pool,
+	    dsl_dataset_set_quota_check, dsl_dataset_set_quota_sync,
+	    ds, &psa, 0);
+
 	dsl_dataset_rele(ds, FTAG);
 	return (err);
 }
@@ -3147,9 +3163,10 @@ static int
 dsl_dataset_set_reservation_check(void *arg1, void *arg2, dmu_tx_t *tx)
 {
 	dsl_dataset_t *ds = arg1;
-	uint64_t *reservationp = arg2;
-	uint64_t new_reservation = *reservationp;
+	dsl_prop_setarg_t *psa = arg2;
+	uint64_t effective_value;
 	uint64_t unique;
+	int err;
 
 	if (spa_version(ds->ds_dir->dd_pool->dp_spa) <
 	    SPA_VERSION_REFRESERVATION)
@@ -3157,6 +3174,11 @@ dsl_dataset_set_reservation_check(void *arg1, void *arg2, dmu_tx_t *tx)
 
 	if (dsl_dataset_is_snapshot(ds))
 		return (EINVAL);
+
+	if ((err = dsl_prop_predict_sync(ds->ds_dir, psa)) != 0)
+		return (err);
+
+	effective_value = psa->psa_effective_value;
 
 	/*
 	 * If we are doing the preliminary check in open context, the
@@ -3169,14 +3191,14 @@ dsl_dataset_set_reservation_check(void *arg1, void *arg2, dmu_tx_t *tx)
 	unique = dsl_dataset_unique(ds);
 	mutex_exit(&ds->ds_lock);
 
-	if (MAX(unique, new_reservation) > MAX(unique, ds->ds_reserved)) {
-		uint64_t delta = MAX(unique, new_reservation) -
+	if (MAX(unique, effective_value) > MAX(unique, ds->ds_reserved)) {
+		uint64_t delta = MAX(unique, effective_value) -
 		    MAX(unique, ds->ds_reserved);
 
 		if (delta > dsl_dir_space_available(ds->ds_dir, NULL, 0, TRUE))
 			return (ENOSPC);
 		if (ds->ds_quota > 0 &&
-		    new_reservation > ds->ds_quota)
+		    effective_value > ds->ds_quota)
 			return (ENOSPC);
 	}
 
@@ -3189,36 +3211,42 @@ dsl_dataset_set_reservation_sync(void *arg1, void *arg2, cred_t *cr,
     dmu_tx_t *tx)
 {
 	dsl_dataset_t *ds = arg1;
-	uint64_t *reservationp = arg2;
-	uint64_t new_reservation = *reservationp;
+	dsl_prop_setarg_t *psa = arg2;
+	uint64_t effective_value = psa->psa_effective_value;
 	uint64_t unique;
 	int64_t delta;
+
+	dsl_prop_set_sync(ds, psa, cr, tx);
+	DSL_PROP_CHECK_PREDICTION(ds->ds_dir, psa);
 
 	dmu_buf_will_dirty(ds->ds_dbuf, tx);
 
 	mutex_enter(&ds->ds_dir->dd_lock);
 	mutex_enter(&ds->ds_lock);
 	unique = dsl_dataset_unique(ds);
-	delta = MAX(0, (int64_t)(new_reservation - unique)) -
+	delta = MAX(0, (int64_t)(effective_value - unique)) -
 	    MAX(0, (int64_t)(ds->ds_reserved - unique));
-	ds->ds_reserved = new_reservation;
+	ds->ds_reserved = effective_value;
 	mutex_exit(&ds->ds_lock);
 
 	dsl_dir_diduse_space(ds->ds_dir, DD_USED_REFRSRV, delta, 0, 0, tx);
 	mutex_exit(&ds->ds_dir->dd_lock);
-	dsl_dir_prop_set_uint64_sync(ds->ds_dir, "refreservation",
-	    new_reservation, cr, tx);
 
 	spa_history_internal_log(LOG_DS_REFRESERV,
 	    ds->ds_dir->dd_pool->dp_spa, tx, cr, "%lld dataset = %llu",
-	    (longlong_t)new_reservation, ds->ds_object);
+	    (longlong_t)effective_value, ds->ds_object);
 }
 
 int
-dsl_dataset_set_reservation(const char *dsname, uint64_t reservation)
+dsl_dataset_set_reservation(const char *dsname, zprop_source_t source,
+    uint64_t reservation)
 {
 	dsl_dataset_t *ds;
+	dsl_prop_setarg_t psa;
 	int err;
+
+	dsl_prop_setarg_init_uint64(&psa, "refreservation", source,
+	    &reservation);
 
 	err = dsl_dataset_hold(dsname, FTAG, &ds);
 	if (err)
@@ -3226,7 +3254,8 @@ dsl_dataset_set_reservation(const char *dsname, uint64_t reservation)
 
 	err = dsl_sync_task_do(ds->ds_dir->dd_pool,
 	    dsl_dataset_set_reservation_check,
-	    dsl_dataset_set_reservation_sync, ds, &reservation, 0);
+	    dsl_dataset_set_reservation_sync, ds, &psa, 0);
+
 	dsl_dataset_rele(ds, FTAG);
 	return (err);
 }
@@ -3320,7 +3349,7 @@ dsl_dataset_user_hold_sync(void *arg1, void *arg2, cred_t *cr, dmu_tx_t *tx)
 }
 
 static int
-dsl_dataset_user_hold_one(char *dsname, void *arg)
+dsl_dataset_user_hold_one(const char *dsname, void *arg)
 {
 	struct dsl_ds_holdarg *ha = arg;
 	dsl_dataset_t *ds;
@@ -3338,7 +3367,7 @@ dsl_dataset_user_hold_one(char *dsname, void *arg)
 	} else if (error == ENOENT && ha->recursive) {
 		error = 0;
 	} else {
-		(void) strcpy(ha->failed, dsname);
+		(void) strlcpy(ha->failed, dsname, sizeof (ha->failed));
 	}
 	return (error);
 }
@@ -3391,7 +3420,7 @@ dsl_dataset_user_hold(char *dsname, char *snapname, char *htag,
 		error = ENOENT;
 
 	if (error)
-		(void) strcpy(dsname, ha->failed);
+		(void) strlcpy(dsname, ha->failed, sizeof (ha->failed));
 
 	dsl_sync_task_group_destroy(ha->dstg);
 	kmem_free(ha, sizeof (struct dsl_ds_holdarg));
@@ -3516,7 +3545,7 @@ dsl_dataset_user_release_sync(void *arg1, void *tag, cred_t *cr, dmu_tx_t *tx)
 }
 
 static int
-dsl_dataset_user_release_one(char *dsname, void *arg)
+dsl_dataset_user_release_one(const char *dsname, void *arg)
 {
 	struct dsl_ds_holdarg *ha = arg;
 	struct dsl_ds_releasearg *ra;
@@ -3533,7 +3562,7 @@ dsl_dataset_user_release_one(char *dsname, void *arg)
 	strfree(name);
 	if (error == ENOENT && ha->recursive)
 		return (0);
-	(void) strcpy(ha->failed, dsname);
+	(void) strlcpy(ha->failed, dsname, sizeof (ha->failed));
 	if (error)
 		return (error);
 
@@ -3583,6 +3612,7 @@ dsl_dataset_user_release(char *dsname, char *snapname, char *htag,
 	spa_t *spa;
 	int error;
 
+top:
 	ha = kmem_zalloc(sizeof (struct dsl_ds_holdarg), KM_SLEEP);
 
 	(void) strlcpy(ha->failed, dsname, sizeof (ha->failed));
@@ -3625,12 +3655,24 @@ dsl_dataset_user_release(char *dsname, char *snapname, char *htag,
 	if (error == 0 && recursive && !ha->gotone)
 		error = ENOENT;
 
-	if (error)
-		(void) strcpy(dsname, ha->failed);
+	if (error && error != EBUSY)
+		(void) strlcpy(dsname, ha->failed, sizeof (ha->failed));
 
 	dsl_sync_task_group_destroy(ha->dstg);
 	kmem_free(ha, sizeof (struct dsl_ds_holdarg));
 	spa_close(spa, FTAG);
+
+	/*
+	 * We can get EBUSY if we were racing with deferred destroy and
+	 * dsl_dataset_user_release_check() hadn't done the necessary
+	 * open context setup.  We can also get EBUSY if we're racing
+	 * with destroy and that thread is the ds_owner.  Either way
+	 * the busy condition should be transient, and we should retry
+	 * the release operation.
+	 */
+	if (error == EBUSY)
+		goto top;
+
 	return (error);
 }
 
@@ -3700,7 +3742,7 @@ dsl_dataset_get_holds(const char *dsname, nvlist_t **nvp)
  */
 /* ARGSUSED */
 int
-dsl_destroy_inconsistent(char *dsname, void *arg)
+dsl_destroy_inconsistent(const char *dsname, void *arg)
 {
 	dsl_dataset_t *ds;
 

@@ -178,7 +178,7 @@ int dmu_objset_snapshot(char *fsname, char *snapname, struct nvlist *props,
     boolean_t recursive);
 int dmu_objset_rename(const char *name, const char *newname,
     boolean_t recursive);
-int dmu_objset_find(char *name, int func(char *, void *), void *arg,
+int dmu_objset_find(char *name, int func(const char *, void *), void *arg,
     int flags);
 void dmu_objset_byteswap(void *buf, size_t size);
 
@@ -211,6 +211,10 @@ typedef void dmu_buf_evict_func_t(struct dmu_buf *db, void *user_ptr);
 
 /* 4x8 zbookmark_t */
 #define	DMU_POOL_SCRUB_BOOKMARK		"scrub_bookmark"
+/* 4x8 ddt_bookmark_t */
+#define	DMU_POOL_SCRUB_DDT_BOOKMARK	"scrub_ddt_bookmark"
+/* 1x8 max_class */
+#define	DMU_POOL_SCRUB_DDT_CLASS_MAX	"scrub_ddt_class_max"
 /* 1x8 zap obj DMU_OT_SCRUB_QUEUE */
 #define	DMU_POOL_SCRUB_QUEUE		"scrub_queue"
 /* 1x8 txg */
@@ -679,11 +683,12 @@ typedef struct dmu_recv_cookie {
 	struct dsl_dataset *drc_real_ds;
 	struct drr_begin *drc_drrb;
 	char *drc_tosnap;
+	char *drc_top_ds;
 	boolean_t drc_newfs;
 	boolean_t drc_force;
 } dmu_recv_cookie_t;
 
-int dmu_recv_begin(char *tofs, char *tosnap, struct drr_begin *,
+int dmu_recv_begin(char *tofs, char *tosnap, char *topds, struct drr_begin *,
     boolean_t force, objset_t *origin, dmu_recv_cookie_t *);
 int dmu_recv_stream(dmu_recv_cookie_t *drc, struct vnode *vp, offset_t *voffp);
 int dmu_recv_end(dmu_recv_cookie_t *drc);

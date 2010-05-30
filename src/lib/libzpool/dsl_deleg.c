@@ -66,8 +66,6 @@
  * The ZAP OBJ is referred to as the jump object.
  */
 
-/* #pragma ident	"%Z%%M%	%I%	%E% SMI" */
-
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_tx.h>
@@ -589,7 +587,7 @@ dsl_deleg_access(const char *dsname, const char *perm, cred_t *cr)
 
 			if (dsl_prop_get_dd(dd,
 			    zfs_prop_to_name(ZFS_PROP_ZONED),
-			    8, 1, &zoned, NULL) != 0)
+			    8, 1, &zoned, NULL, B_FALSE) != 0)
 				break;
 			if (!zoned)
 				break;

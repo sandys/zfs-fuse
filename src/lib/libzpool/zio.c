@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -52,11 +52,12 @@ uint8_t zio_priority_table[ZIO_PRIORITY_TABLE_SIZE] = {
 	0,	/* ZIO_PRIORITY_NOW		*/
 	0,	/* ZIO_PRIORITY_SYNC_READ	*/
 	0,	/* ZIO_PRIORITY_SYNC_WRITE	*/
-	6,	/* ZIO_PRIORITY_ASYNC_READ	*/
-	4,	/* ZIO_PRIORITY_ASYNC_WRITE	*/
-	4,	/* ZIO_PRIORITY_FREE		*/
-	0,	/* ZIO_PRIORITY_CACHE_FILL	*/
 	0,	/* ZIO_PRIORITY_LOG_WRITE	*/
+	1,	/* ZIO_PRIORITY_CACHE_FILL	*/
+	1,	/* ZIO_PRIORITY_AGG		*/
+	4,	/* ZIO_PRIORITY_FREE		*/
+	4,	/* ZIO_PRIORITY_ASYNC_WRITE	*/
+	6,	/* ZIO_PRIORITY_ASYNC_READ	*/
 	10,	/* ZIO_PRIORITY_RESILVER	*/
 	20,	/* ZIO_PRIORITY_SCRUB		*/
 };
@@ -67,7 +68,9 @@ uint8_t zio_priority_table[ZIO_PRIORITY_TABLE_SIZE] = {
  * ==========================================================================
  */
 char *zio_type_name[ZIO_TYPES] = {
-	"null", "read", "write", "free", "claim", "ioctl" };
+	"zio_null", "zio_read", "zio_write", "zio_free", "zio_claim",
+	"zio_ioctl"
+};
 
 /*
  * ==========================================================================
@@ -79,7 +82,7 @@ kmem_cache_t *zio_link_cache;
 kmem_cache_t *zio_buf_cache[SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT];
 kmem_cache_t *zio_data_buf_cache[SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT];
 
-#if 0
+#ifdef _KERNEL
 extern vmem_t *zio_alloc_arena;
 #endif
 
@@ -102,6 +105,7 @@ zio_init(void)
 	vmem_t *data_alloc_arena = NULL;
 
 #if 0
+	// zio_alloc_arena is NULL normally
 	data_alloc_arena = zio_alloc_arena;
 #endif
 	zio_cache = kmem_cache_create("zio_cache",
@@ -770,9 +774,9 @@ zio_write_phys(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
 
 	zio->io_prop.zp_checksum = checksum;
 
-	if (zio_checksum_table[checksum].ci_zbt) {
+	if (zio_checksum_table[checksum].ci_eck) {
 		/*
-		 * zbt checksums are necessarily destructive -- they modify
+		 * zec checksums are necessarily destructive -- they modify
 		 * the end of the write buffer to hold the verifier/checksum.
 		 * Therefore, we must make a local copy in case the data is
 		 * being written to multiple places in parallel.
@@ -855,6 +859,23 @@ zio_flush(zio_t *zio, vdev_t *vd)
 	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_DONT_RETRY));
 }
 
+void
+zio_shrink(zio_t *zio, uint64_t size)
+{
+	ASSERT(zio->io_executor == NULL);
+	ASSERT(zio->io_orig_size == zio->io_size);
+	ASSERT(size <= zio->io_size);
+
+	/*
+	 * We don't shrink for raidz because of problems with the
+	 * reconstruction when reading back less than the block size.
+	 * Note, BP_IS_RAIDZ() assumes no compression.
+	 */
+	ASSERT(BP_GET_COMPRESS(zio->io_bp) == ZIO_COMPRESS_OFF);
+	if (!BP_IS_RAIDZ(zio->io_bp))
+		zio->io_orig_size = zio->io_size = size;
+}
+
 /*
  * ==========================================================================
  * Prepare to read and write logical blocks
@@ -876,6 +897,9 @@ zio_read_bp_init(zio_t *zio)
 	}
 
 	if (!dmu_ot[BP_GET_TYPE(bp)].ot_metadata && BP_GET_LEVEL(bp) == 0)
+		zio->io_flags |= ZIO_FLAG_DONT_CACHE;
+
+	if (BP_GET_TYPE(bp) == DMU_OT_DDT_ZAP)
 		zio->io_flags |= ZIO_FLAG_DONT_CACHE;
 
 	if (BP_GET_DEDUP(bp) && zio->io_child_type == ZIO_CHILD_LOGICAL)
@@ -1019,10 +1043,6 @@ zio_free_bp_init(zio_t *zio)
 			arc_free(zio->io_spa, bp);
 	}
 
-	if (zio_injection_enabled &&
-	    zio->io_spa->spa_syncing_txg == zio->io_txg)
-		zio_handle_ignored_writes(zio);
-
 	return (ZIO_PIPELINE_CONTINUE);
 }
 
@@ -1035,6 +1055,7 @@ zio_free_bp_init(zio_t *zio)
 static void
 zio_taskq_dispatch(zio_t *zio, enum zio_taskq_type q)
 {
+	spa_t *spa = zio->io_spa;
 	zio_type_t t = zio->io_type;
 
 	/*
@@ -1051,7 +1072,15 @@ zio_taskq_dispatch(zio_t *zio, enum zio_taskq_type q)
 	if (t == ZIO_TYPE_WRITE && zio->io_vd && zio->io_vd->vdev_aux)
 		t = ZIO_TYPE_NULL;
 
-	(void) taskq_dispatch(zio->io_spa->spa_zio_taskq[t][q],
+	/*
+	 * If this is a high priority I/O, then use the high priority taskq.
+	 */
+	if (zio->io_priority == ZIO_PRIORITY_NOW &&
+	    spa->spa_zio_taskq[t][q + 1] != NULL)
+		q++;
+
+	ASSERT3U(q, <, ZIO_TASKQ_TYPES);
+	(void) taskq_dispatch(spa->spa_zio_taskq[t][q],
 	    (task_func_t *)zio_execute, zio, TQ_SLEEP);
 }
 
@@ -1163,6 +1192,7 @@ zio_wait(zio_t *zio)
 
 	error = zio->io_error;
 	zio_destroy(zio);
+	pthread_yield();
 
 	return (error);
 }
@@ -1516,7 +1546,7 @@ zio_gang_tree_assemble_done(zio_t *zio)
 
 	ASSERT(zio->io_data == gn->gn_gbh);
 	ASSERT(zio->io_size == SPA_GANGBLOCKSIZE);
-	ASSERT(gn->gn_gbh->zg_tail.zbt_magic == ZBT_MAGIC);
+	ASSERT(gn->gn_gbh->zg_tail.zec_magic == ZEC_MAGIC);
 
 	for (int g = 0; g < SPA_GBH_NBLKPTRS; g++) {
 		blkptr_t *gbp = &gn->gn_gbh->zg_blkptr[g];
@@ -1543,7 +1573,7 @@ zio_gang_tree_issue(zio_t *pio, zio_gang_node_t *gn, blkptr_t *bp, void *data)
 	zio = zio_gang_issue_func[gio->io_type](pio, bp, gn, data);
 
 	if (gn != NULL) {
-		ASSERT(gn->gn_gbh->zg_tail.zbt_magic == ZBT_MAGIC);
+		ASSERT(gn->gn_gbh->zg_tail.zec_magic == ZEC_MAGIC);
 
 		for (int g = 0; g < SPA_GBH_NBLKPTRS; g++) {
 			blkptr_t *gbp = &gn->gn_gbh->zg_blkptr[g];
@@ -1751,7 +1781,8 @@ zio_ddt_read_start(zio_t *zio)
 		for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
 			if (ddp->ddp_phys_birth == 0 || ddp == ddp_self)
 				continue;
-			ddt_bp_create(ddt, &dde->dde_key, ddp, &blk);
+			ddt_bp_create(ddt->ddt_checksum, &dde->dde_key, ddp,
+			    &blk);
 			zio_nowait(zio_read(zio, zio->io_spa, &blk,
 			    zio_buf_alloc(zio->io_size), zio->io_size,
 			    zio_ddt_child_read_done, dde, zio->io_priority,
@@ -1784,7 +1815,7 @@ zio_ddt_read_done(zio_t *zio)
 		ddt_t *ddt = ddt_select(zio->io_spa, bp);
 		ddt_entry_t *dde = zio->io_vsd;
 		if (ddt == NULL) {
-			ASSERT(zio->io_spa->spa_load_state != SPA_LOAD_NONE);
+			ASSERT(spa_load_state(zio->io_spa) != SPA_LOAD_NONE);
 			return (ZIO_PIPELINE_CONTINUE);
 		}
 		if (dde == NULL) {
@@ -2169,7 +2200,9 @@ zio_alloc_zil(spa_t *spa, uint64_t txg, blkptr_t *new_bp, blkptr_t *old_bp,
 		BP_SET_LSIZE(new_bp, size);
 		BP_SET_PSIZE(new_bp, size);
 		BP_SET_COMPRESS(new_bp, ZIO_COMPRESS_OFF);
-		BP_SET_CHECKSUM(new_bp, ZIO_CHECKSUM_ZILOG);
+		BP_SET_CHECKSUM(new_bp,
+		    spa_version(spa) >= SPA_VERSION_SLIM_ZIL
+		    ? ZIO_CHECKSUM_ZILOG2 : ZIO_CHECKSUM_ZILOG);
 		BP_SET_TYPE(new_bp, DMU_OT_INTENT_LOG);
 		BP_SET_LEVEL(new_bp, 0);
 		BP_SET_DEDUP(new_bp, 0);
@@ -2584,6 +2617,10 @@ zio_ready(zio_t *zio)
 		}
 	}
 
+	if (zio_injection_enabled &&
+	    zio->io_spa->spa_syncing_txg == zio->io_txg)
+		zio_handle_ignored_writes(zio);
+
 	return (ZIO_PIPELINE_CONTINUE);
 }
 
@@ -2706,7 +2743,7 @@ zio_done(zio_t *zio)
 		if ((zio->io_type == ZIO_TYPE_READ ||
 		    zio->io_type == ZIO_TYPE_FREE) &&
 		    zio->io_error == ENXIO &&
-		    spa->spa_load_state == SPA_LOAD_NONE &&
+		    spa_load_state(spa) == SPA_LOAD_NONE &&
 		    spa_get_failmode(spa) != ZIO_FAILURE_MODE_CONTINUE)
 			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
 

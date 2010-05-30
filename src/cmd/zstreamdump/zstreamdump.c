@@ -33,6 +33,7 @@
 #include <sys/dmu.h>
 #include <sys/zfs_ioctl.h>
 #include <zfs_fletcher.h>
+#include "format.h"
 
 uint64_t drr_record_count[DRR_NUMTYPES];
 uint64_t total_write_size = 0;
@@ -86,11 +87,12 @@ main(int argc, char *argv[])
 	struct drr_object *drro = &thedrr.drr_u.drr_object;
 	struct drr_freeobjects *drrfo = &thedrr.drr_u.drr_freeobjects;
 	struct drr_write *drrw = &thedrr.drr_u.drr_write;
+	struct drr_write_byref *drrwbr = &thedrr.drr_u.drr_write_byref;
 	struct drr_free *drrf = &thedrr.drr_u.drr_free;
 	char c;
 	boolean_t verbose = B_FALSE;
 	boolean_t first = B_TRUE;
-	int i, err;
+	int err;
 	zio_cksum_t zc = { 0 };
 	zio_cksum_t pcksum = { 0 };
 
@@ -172,7 +174,8 @@ main(int argc, char *argv[])
 		case DRR_BEGIN:
 			if (do_byteswap) {
 				drrb->drr_magic = BSWAP_64(drrb->drr_magic);
-				drrb->drr_version = BSWAP_64(drrb->drr_version);
+				drrb->drr_versioninfo =
+				    BSWAP_64(drrb->drr_versioninfo);
 				drrb->drr_creation_time =
 				    BSWAP_64(drrb->drr_creation_time);
 				drrb->drr_type = BSWAP_32(drrb->drr_type);
@@ -183,8 +186,10 @@ main(int argc, char *argv[])
 			}
 
 			(void) printf("BEGIN record\n");
-			(void) printf("\tversion = %llx\n",
-			    (u_longlong_t)drrb->drr_version);
+			(void) printf("\thdrtype = %lld\n",
+			    DMU_GET_STREAM_HDRTYPE(drrb->drr_versioninfo));
+			(void) printf("\tfeatures = %llx\n",
+			    DMU_GET_FEATUREFLAGS(drrb->drr_versioninfo));
 			(void) printf("\tmagic = %llx\n",
 			    (u_longlong_t)drrb->drr_magic);
 			(void) printf("\tcreation_time = %llx\n",
@@ -199,8 +204,8 @@ main(int argc, char *argv[])
 			if (verbose)
 				(void) printf("\n");
 
-			if (drrb->drr_version == 2 &&
-			    drr->drr_payloadlen != 0) {
+			if ((DMU_GET_STREAM_HDRTYPE(drrb->drr_versioninfo) ==
+			    DMU_COMPOUNDSTREAM) && drr->drr_payloadlen != 0) {
 				nvlist_t *nv;
 				int sz = drr->drr_payloadlen;
 
@@ -240,13 +245,13 @@ main(int argc, char *argv[])
 				(void) printf("Expected checksum differs from "
 				    "checksum in stream.\n");
 				(void) printf("Expected checksum = "
-				    "%llx/%llx/%llx/%llx\n",
+				    FX64 "/" FX64 "/" FX64 "/" FX64 "\n",
 				    pcksum.zc_word[0],
 				    pcksum.zc_word[1],
 				    pcksum.zc_word[2],
 				    pcksum.zc_word[3]);
 			}
-			(void) printf("END checksum = %llx/%llx/%llx/%llx\n",
+			(void) printf("END checksum = " FX64 "/" FX64 "/" FX64 "/" FX64 "\n",
 			    drre->drr_checksum.zc_word[0],
 			    drre->drr_checksum.zc_word[1],
 			    drre->drr_checksum.zc_word[2],
@@ -264,6 +269,7 @@ main(int argc, char *argv[])
 				drro->drr_blksz = BSWAP_32(drro->drr_blksz);
 				drro->drr_bonuslen =
 				    BSWAP_32(drro->drr_bonuslen);
+				drro->drr_toguid = BSWAP_64(drro->drr_toguid);
 			}
 			if (verbose) {
 				(void) printf("OBJECT object = %llu type = %u "
@@ -286,6 +292,7 @@ main(int argc, char *argv[])
 				    BSWAP_64(drrfo->drr_firstobj);
 				drrfo->drr_numobjs =
 				    BSWAP_64(drrfo->drr_numobjs);
+				drrfo->drr_toguid = BSWAP_64(drrfo->drr_toguid);
 			}
 			if (verbose) {
 				(void) printf("FREEOBJECTS firstobj = %llu "
@@ -301,17 +308,61 @@ main(int argc, char *argv[])
 				drrw->drr_type = BSWAP_32(drrw->drr_type);
 				drrw->drr_offset = BSWAP_64(drrw->drr_offset);
 				drrw->drr_length = BSWAP_64(drrw->drr_length);
+				drrw->drr_toguid = BSWAP_64(drrw->drr_toguid);
+				drrw->drr_key.ddk_prop =
+				    BSWAP_64(drrw->drr_key.ddk_prop);
 			}
 			if (verbose) {
 				(void) printf("WRITE object = %llu type = %u "
-				    "offset = %llu length = %llu\n",
+				    "checksum type = %u\n"
+				    "offset = %llu length = %llu "
+				    "props = %llx\n",
 				    (u_longlong_t)drrw->drr_object,
 				    drrw->drr_type,
+				    drrw->drr_checksumtype,
 				    (u_longlong_t)drrw->drr_offset,
-				    (u_longlong_t)drrw->drr_length);
+				    (u_longlong_t)drrw->drr_length,
+				    (u_longlong_t)drrw->drr_key.ddk_prop);
 			}
 			(void) ssread(buf, drrw->drr_length, &zc);
 			total_write_size += drrw->drr_length;
+			break;
+
+		case DRR_WRITE_BYREF:
+			if (do_byteswap) {
+				drrwbr->drr_object =
+				    BSWAP_64(drrwbr->drr_object);
+				drrwbr->drr_offset =
+				    BSWAP_64(drrwbr->drr_offset);
+				drrwbr->drr_length =
+				    BSWAP_64(drrwbr->drr_length);
+				drrwbr->drr_toguid =
+				    BSWAP_64(drrwbr->drr_toguid);
+				drrwbr->drr_refguid =
+				    BSWAP_64(drrwbr->drr_refguid);
+				drrwbr->drr_refobject =
+				    BSWAP_64(drrwbr->drr_refobject);
+				drrwbr->drr_refoffset =
+				    BSWAP_64(drrwbr->drr_refoffset);
+				drrwbr->drr_key.ddk_prop =
+				    BSWAP_64(drrwbr->drr_key.ddk_prop);
+			}
+			if (verbose) {
+				(void) printf("WRITE_BYREF object = %llu "
+				    "checksum type = %u props = %llx\n"
+				    "offset = %llu length = %llu\n"
+				    "toguid = %llx refguid = %llx\n"
+				    "refobject = %llu refoffset = %llu\n",
+				    (u_longlong_t)drrwbr->drr_object,
+				    drrwbr->drr_checksumtype,
+				    (u_longlong_t)drrwbr->drr_key.ddk_prop,
+				    (u_longlong_t)drrwbr->drr_offset,
+				    (u_longlong_t)drrwbr->drr_length,
+				    (u_longlong_t)drrwbr->drr_toguid,
+				    (u_longlong_t)drrwbr->drr_refguid,
+				    (u_longlong_t)drrwbr->drr_refobject,
+				    (u_longlong_t)drrwbr->drr_refoffset);
+			}
 			break;
 
 		case DRR_FREE:

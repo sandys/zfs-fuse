@@ -135,6 +135,7 @@
 #include <sys/kstat.h>
 #include <zfs_fletcher.h>
 #include <syslog.h>
+#include "format.h"
 
 static kmutex_t		arc_reclaim_thr_lock;
 static kcondvar_t	arc_reclaim_thr_cv;	/* used to signal reclaim thr */
@@ -1091,7 +1092,6 @@ arc_change_state(arc_state_t *new_state, arc_buf_hdr_t *ab, kmutex_t *hash_lock)
 				to_delta = ab->b_size;
 			}
 			atomic_add_64(size, to_delta);
-			atomic_add_64(&new_state->arcs_size, to_delta);
 
 			if (use_mutex)
 				mutex_exit(&new_state->arcs_mtx);
@@ -1104,7 +1104,7 @@ arc_change_state(arc_state_t *new_state, arc_buf_hdr_t *ab, kmutex_t *hash_lock)
 	}
 
 	/* adjust state sizes */
-	if (to_delta && (refcnt != 0 || new_state == arc_anon))
+	if (to_delta)
 		atomic_add_64(&new_state->arcs_size, to_delta);
 	if (from_delta) {
 		ASSERT3U(old_state->arcs_size, >=, from_delta);
@@ -1708,6 +1708,7 @@ arc_evict_ghost(arc_state_t *state, uint64_t spa, int64_t bytes)
 	kmutex_t *hash_lock;
 	uint64_t bytes_deleted = 0;
 	uint64_t bufs_skipped = 0;
+	boolean_t have_lock;
 
 	ASSERT(GHOST_STATE(state));
 top:
@@ -1717,7 +1718,8 @@ top:
 		if (spa && ab->b_spa != spa)
 			continue;
 		hash_lock = HDR_LOCK(ab);
-		if (mutex_tryenter(hash_lock)) {
+		have_lock = MUTEX_HELD(hash_lock);
+		if (have_lock || mutex_tryenter(hash_lock)) {
 			ASSERT(!HDR_IO_IN_PROGRESS(ab));
 			ASSERT(ab->b_buf == NULL);
 			ARCSTAT_BUMP(arcstat_deleted);
@@ -1729,10 +1731,12 @@ top:
 				 * don't destroy the header.
 				 */
 				arc_change_state(arc_l2c_only, ab, hash_lock);
-				mutex_exit(hash_lock);
+				if (!have_lock)
+					mutex_exit(hash_lock);
 			} else {
 				arc_change_state(arc_anon, ab, hash_lock);
-				mutex_exit(hash_lock);
+				if (!have_lock)
+					mutex_exit(hash_lock);
 				arc_hdr_destroy(ab);
 			}
 
@@ -1927,11 +1931,6 @@ arc_shrink(void)
 static int
 arc_reclaim_needed(void)
 {
-	static int counter;
-	if (counter++ > 500) {
-		counter = 0;
-		return 1;
-	}
 #if 0
 	uint64_t extra;
 
@@ -2039,7 +2038,7 @@ arc_kmem_reap_now(arc_reclaim_strategy_t strat)
 static void
 arc_reclaim_thread(void)
 {
-	int64_t			growtime = 0;
+	uint64_t			growtime = 0;
 	arc_reclaim_strategy_t	last_reclaim = ARC_RECLAIM_CONS;
 	callb_cpr_t		cpr;
 
@@ -2744,10 +2743,13 @@ top:
 			buf->b_private = NULL;
 			buf->b_next = NULL;
 			hdr->b_buf = buf;
-			arc_get_data_buf(buf);
 			ASSERT(hdr->b_datacnt == 0);
 			hdr->b_datacnt = 1;
+			arc_access(hdr, hash_lock);
+			arc_get_data_buf(buf);
 		}
+
+		ASSERT(!GHOST_STATE(hdr->b_state));
 
 		acb = kmem_zalloc(sizeof (arc_callback_t), KM_SLEEP);
 		acb->acb_done = done;
@@ -2756,17 +2758,6 @@ top:
 		ASSERT(hdr->b_acb == NULL);
 		hdr->b_acb = acb;
 		hdr->b_flags |= ARC_IO_IN_PROGRESS;
-
-		/*
-		 * If the buffer has been evicted, migrate it to a present state
-		 * before issuing the I/O.  Once we drop the hash-table lock,
-		 * the header will be marked as I/O in progress and have an
-		 * attached buffer.  At this point, anybody who finds this
-		 * buffer ought to notice that it's legit but has a pending I/O.
-		 */
-
-		if (GHOST_STATE(hdr->b_state))
-			arc_access(hdr, hash_lock);
 
 		if (HDR_L2CACHE(hdr) && hdr->b_l2hdr != NULL &&
 		    (vd = hdr->b_l2hdr->b_dev->l2ad_vdev) != NULL) {
@@ -3106,6 +3097,7 @@ arc_has_callback(arc_buf_t *buf)
 	return (callback);
 }
 
+#ifdef ZFS_DEBUG
 int
 arc_referenced(arc_buf_t *buf)
 {
@@ -3116,6 +3108,7 @@ arc_referenced(arc_buf_t *buf)
 	rw_exit(&buf->b_lock);
 	return (referenced);
 }
+#endif
 
 static void
 arc_write_ready(zio_t *zio)
@@ -3429,7 +3422,7 @@ arc_init(void)
 	arc_c_min = 16<<20;
 	if (max_arc_size) {
 		if (max_arc_size < arc_c_min) {
-			syslog(LOG_WARNING,"max_arc_size too small (%ld bytes), using arc_c_min (%ld bytes)",max_arc_size,arc_c_min);
+			syslog(LOG_WARNING,"max_arc_size too small (" FI64 " bytes), using arc_c_min (" FI64 " bytes)",max_arc_size,arc_c_min);
 			arc_c_max = arc_c_min;
 		} else {
 			arc_c_max = max_arc_size;
@@ -3442,8 +3435,8 @@ arc_init(void)
 	arc_c_max = 64<<20;
 #endif
 	}
-	syslog(LOG_NOTICE,"ARC setup: min ARC size set to %ld bytes",arc_c_min);
-	syslog(LOG_NOTICE,"ARC setup: max ARC size set to %ld bytes",arc_c_max);
+	syslog(LOG_NOTICE,"ARC setup: min ARC size set to " FI64 " bytes",arc_c_min);
+	syslog(LOG_NOTICE,"ARC setup: max ARC size set to " FI64 " bytes",arc_c_max);
 
 	/*
 	 * Allow the tunables to override our calculations if they are

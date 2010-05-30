@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -32,6 +32,7 @@
 #include <sys/zfs_context.h>
 #include <sys/zio.h>
 #include <sys/dnode.h>
+#include <sys/ddt.h>
 
 #ifdef	__cplusplus
 extern "C" {
@@ -83,7 +84,7 @@ typedef struct dsl_pool {
 	blkptr_t dp_meta_rootbp;
 	list_t dp_synced_datasets;
 	hrtime_t dp_read_overhead;
-	uint64_t dp_throughput;
+	uint64_t dp_throughput; /* bytes per millisec */
 	uint64_t dp_write_limit;
 	uint64_t dp_tmp_userrefs_obj;
 
@@ -96,13 +97,15 @@ typedef struct dsl_pool {
 	uint64_t dp_scrub_queue_obj;
 	uint64_t dp_scrub_min_txg;
 	uint64_t dp_scrub_max_txg;
+	uint64_t dp_scrub_start_time;
+	uint64_t dp_scrub_ddt_class_max;
 	zbookmark_t dp_scrub_bookmark;
+	ddt_bookmark_t dp_scrub_ddt_bookmark;
 	boolean_t dp_scrub_pausing;
 	boolean_t dp_scrub_isresilver;
-	uint64_t dp_scrub_start_time;
-	kmutex_t dp_scrub_cancel_lock; /* protects dp_scrub_restart */
 	boolean_t dp_scrub_restart;
-	boolean_t dp_scrub_ditto;
+	kmutex_t dp_scrub_cancel_lock; /* protects dp_scrub_restart */
+	zio_t *dp_scrub_prefetch_zio_root;
 
 	/* Has its own locking */
 	tx_state_t dp_tx;
@@ -145,6 +148,8 @@ int dsl_pool_scrub_cancel(dsl_pool_t *dp);
 int dsl_pool_scrub_clean(dsl_pool_t *dp);
 void dsl_pool_scrub_sync(dsl_pool_t *dp, dmu_tx_t *tx);
 void dsl_pool_scrub_restart(dsl_pool_t *dp);
+void dsl_pool_scrub_ddt_entry(dsl_pool_t *dp, enum zio_checksum checksum,
+    const ddt_entry_t *dde);
 
 taskq_t *dsl_pool_vnrele_taskq(dsl_pool_t *dp);
 

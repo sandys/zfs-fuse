@@ -19,7 +19,7 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -40,7 +40,7 @@
 
 int zfs_no_write_throttle = 0;
 int zfs_write_limit_shift = 3;			/* 1/8th of physical memory */
-int zfs_txg_synctime = 5;			/* target secs to sync a txg */
+int zfs_txg_synctime_ms = 5000;		/* target millisecs to sync a txg */
 
 uint64_t zfs_write_limit_min = 32 << 20;	/* min write limit is 32MB */
 uint64_t zfs_write_limit_max = 0;		/* max data payload per txg */
@@ -92,7 +92,7 @@ dsl_pool_open_impl(spa_t *spa, uint64_t txg)
 	mutex_init(&dp->dp_scrub_cancel_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	dp->dp_vnrele_taskq = taskq_create("zfs_vn_rele_taskq", 1, minclsyspri,
-	    1, 14, 0);
+	    1, 4, 0);
 
 	return (dp);
 }
@@ -172,9 +172,21 @@ dsl_pool_open(spa_t *spa, uint64_t txg, dsl_pool_t **dpp)
 		if (err)
 			goto out;
 		err = zap_lookup(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
-		    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t), 4,
+		    DMU_POOL_SCRUB_BOOKMARK, sizeof (uint64_t),
+		    sizeof (dp->dp_scrub_bookmark) / sizeof (uint64_t),
 		    &dp->dp_scrub_bookmark);
 		if (err)
+			goto out;
+		err = zap_lookup(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+		    DMU_POOL_SCRUB_DDT_BOOKMARK, sizeof (uint64_t),
+		    sizeof (dp->dp_scrub_ddt_bookmark) / sizeof (uint64_t),
+		    &dp->dp_scrub_ddt_bookmark);
+		if (err && err != ENOENT)
+			goto out;
+		err = zap_lookup(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+		    DMU_POOL_SCRUB_DDT_CLASS_MAX, sizeof (uint64_t), 1,
+		    &dp->dp_scrub_ddt_class_max);
+		if (err && err != ENOENT)
 			goto out;
 		err = zap_lookup(dp->dp_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
 		    DMU_POOL_SCRUB_ERRORS, sizeof (uint64_t), 1,
@@ -230,6 +242,7 @@ dsl_pool_close(dsl_pool_t *dp)
 		dmu_objset_evict(dp->dp_meta_objset);
 
 	txg_list_destroy(&dp->dp_dirty_datasets);
+	txg_list_destroy(&dp->dp_sync_tasks);
 	txg_list_destroy(&dp->dp_dirty_dirs);
 	list_destroy(&dp->dp_synced_datasets);
 
@@ -371,8 +384,12 @@ dsl_pool_sync(dsl_pool_t *dp, uint64_t txg)
 		dsl_dir_sync(dd, tx);
 	write_time += gethrtime() - start;
 
-	if (spa_sync_pass(dp->dp_spa) == 1)
+	if (spa_sync_pass(dp->dp_spa) == 1) {
+		dp->dp_scrub_prefetch_zio_root = zio_root(dp->dp_spa, NULL,
+		    NULL, ZIO_FLAG_CANFAIL);
 		dsl_pool_scrub_sync(dp, tx);
+		(void) zio_wait(dp->dp_scrub_prefetch_zio_root);
+	}
 
 	start = gethrtime();
 	if (list_head(&mos->os_dirty_dnodes[txg & TXG_MASK]) != NULL ||
@@ -416,10 +433,14 @@ dsl_pool_sync(dsl_pool_t *dp, uint64_t txg)
 	 * amount of write traffic allowed into each transaction group.
 	 * Weight the throughput calculation towards the current value:
 	 * 	thru = 3/4 old_thru + 1/4 new_thru
+	 *
+	 * Note: write_time is in nanosecs, so write_time/MICROSEC
+	 * yields millisecs
 	 */
 	ASSERT(zfs_write_limit_min > 0);
-	if (data_written > zfs_write_limit_min / 8 && write_time > 0) {
-		uint64_t throughput = (data_written * NANOSEC) / write_time;
+	if (data_written > zfs_write_limit_min / 8 && write_time > MICROSEC) {
+		uint64_t throughput = data_written / (write_time / MICROSEC);
+
 		if (dp->dp_throughput)
 			dp->dp_throughput = throughput / 4 +
 			    3 * dp->dp_throughput / 4;
@@ -427,7 +448,7 @@ dsl_pool_sync(dsl_pool_t *dp, uint64_t txg)
 			dp->dp_throughput = throughput;
 		dp->dp_write_limit = MIN(zfs_write_limit_inflated,
 		    MAX(zfs_write_limit_min,
-		    dp->dp_throughput * zfs_txg_synctime));
+		    dp->dp_throughput * zfs_txg_synctime_ms));
 	}
 }
 
