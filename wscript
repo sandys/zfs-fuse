@@ -61,7 +61,7 @@ subdirs = """
 ####
 def set_options(opt):
     opt.add_option('--prefix', type='string',help='set install path prefix', dest='usr_prefix')
-    opt.add_option('--build', action='store', default='debug,release', help='Choose \'debug/release/debug,release\'')
+    opt.add_option('--debug', action='store', default='1', help='Choose \'0,1,2,3\' or any comma separated combination thereof')
 
 
 def init(ctx):
@@ -81,6 +81,7 @@ def configure(conf):
 
 #    conf.env.CCFLAGS = ['-Wall']
     conf.env.ASFLAGS = ["-c"]
+    conf.env.LINKFLAGS = ['-pipe', '-Wall']
     conf.env.CCFLAGS = ['-pipe', '-Wall', '-std=gnu99', '-Wno-switch', '-Wno-unused', '-Wno-missing-braces', '-Wno-parentheses', '-Wno-uninitialized', '-fno-strict-aliasing', '-D_GNU_SOURCE', '-DLINUX_AIO']
     conf.env.INCLUDEDIR = ['/usr/include/']
 #    conf.env['INCLUDEDIR'] = '/usr/include'
@@ -118,22 +119,43 @@ def configure(conf):
     conf.env.PREFIX = '/'
     conf.env.MANDIR = '/usr/share/man/man8'
     
-    dbg = conf.env.copy()
-    rel = conf.env.copy()
+    debug_3 = conf.env.copy()
+    debug_2 = conf.env.copy()
+    debug_1 = conf.env.copy()
+    debug_0 = conf.env.copy()
 
-    dbg.set_variant('debug')
-    conf.set_env_name('debug', dbg)
-    conf.setenv('debug')
-    #sss - this is a hack. dunno why ASFLAGS dont propagate. maybe a bug
-    conf.env.ASFLAGS='-c'
-    conf.env.CCFLAGS += ['-DDBG_ENABLED']
     
-    rel.set_variant('release')
-    conf.set_env_name('release', rel)
-    conf.setenv('release')
+    debug_3.set_variant('debug_3')
+    conf.set_env_name('debug_3', debug_3)
+    #conf.setenv('debug_3')
     #sss - this is a hack. dunno why ASFLAGS dont propagate. maybe a bug
-    conf.env.ASFLAGS='-c'
-    conf.env.CCFLAGS += ['-O2']
+    debug_3.ASFLAGS='-c'
+    debug_3.append_value('CCFLAGS', ['-ggdb', '-DDEBUG', '-finstrument-functions'])
+    debug_3.append_value('LINKFLAGS', ['-ggdb'])
+    
+    debug_2.set_variant('debug_2')
+    conf.set_env_name('debug_2', debug_2)
+    #conf.setenv('debug_2')
+    #sss - this is a hack. dunno why ASFLAGS dont propagate. maybe a bug
+    debug_2.ASFLAGS='-c'
+    debug_2.append_value('CCFLAGS',['-ggdb', '-DDEBUG'])
+    debug_2.append_value('LINKFLAGS', ['-ggdb'])
+    
+    debug_1.set_variant('debug_1')
+    conf.set_env_name('debug_1', debug_1)
+    #conf.setenv('debug_1')
+    #sss - this is a hack. dunno why ASFLAGS dont propagate. maybe a bug
+    debug_1.ASFLAGS='-c'
+    debug_1.append_value( 'CCFLAGS',['-ggdb', '-O2', '-DDEBUG'])
+    debug_1.append_value('LINKFLAGS', ['-ggdb'])
+    
+    debug_0.set_variant('debug_0')
+    conf.set_env_name('debug_0', debug_0)
+    #conf.setenv('debug_0')
+    #sss - this is a hack. dunno why ASFLAGS dont propagate. maybe a bug
+    debug_0.ASFLAGS='-c'
+    debug_0.append_value('CCFLAGS', ['-s', '-O2', '-DNDEBUG'])
+    debug_0.append_value('LINKFLAGS',['-s'])
 
     conf.sub_config("src/lib/libumem")
 ####
@@ -147,16 +169,22 @@ def build(bld):
     
     # enable the debug or the release variant, depending on the one wanted
     for obj in bld.all_task_gen[:]:
-      debug_obj = obj.clone('debug')
-      release_obj = obj.clone('release')
+      debug_3_obj = obj.clone('debug_3')
+      debug_2_obj = obj.clone('debug_2')
+      debug_1_obj = obj.clone('debug_1')
+      debug_0_obj = obj.clone('debug_0')
 
       #disable "default"
       obj.posted = 1
 
 
       # disable the unwanted variant(s)
-      build_type = Options.options.build
-      if build_type.find('debug') < 0:
-        debug_obj.posted = 1
-      if build_type.find('release') < 0:
-        release_obj.posted = 1
+      build_type = Options.options.debug
+      if build_type.find('3') < 0:
+        debug_3_obj.posted = 1
+      if build_type.find('2') < 0:
+        debug_2_obj.posted = 1
+      if build_type.find('1') < 0:
+        debug_1_obj.posted = 1
+      if build_type.find('0') < 0:
+        debug_0_obj.posted = 1
